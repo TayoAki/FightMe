@@ -92,9 +92,6 @@ export class Sfx {
         this.tone(0.12, 700, 350, 0.3, 'square');
         break;
       case 'super':
-      case 'heat':
-      case 'heatSmash':
-      case 'rageArt':
         for (const [i, f] of [262, 330, 392, 523].entries()) this.tone(0.7, f, f * 2, 0.16, 'sawtooth', i * 0.04);
         this.burst(0.8, 300, 0.7, 0.4, 'lowpass', 4000);
         break;
@@ -109,9 +106,30 @@ export class Sfx {
         this.tone(0.5, 70, 30, 0.8);
         this.burst(0.35, 500, 0.6, 0.6, 'lowpass');
         break;
-      case 'justFrame':
+      case 'teleport':
         this.burst(0.3, 5000, 2, 0.4, 'highpass');
         this.tone(0.3, 2400, 600, 0.2, 'sawtooth');
+        break;
+      case 'beam':
+        this.burst(0.9, 500, 0.8, 0.45, 'lowpass', 3000);
+        this.tone(0.9, 180, 360, 0.25, 'sawtooth');
+        break;
+      case 'beamClash':
+        this.burst(1.2, 300, 0.6, 0.6, 'lowpass', 2500);
+        this.tone(1.2, 90, 180, 0.5, 'sawtooth');
+        this.say('Clash!');
+        break;
+      case 'clashWin':
+        this.tone(0.9, 140, 40, 0.9);
+        this.burst(0.9, 900, 0.5, 0.7, 'lowpass', 100);
+        break;
+      case 'assist':
+      case 'tagSwap':
+        this.tone(0.18, 660, 990, 0.2, 'triangle');
+        this.burst(0.2, 2000, 1, 0.15, 'bandpass', 4000);
+        break;
+      case 'assistHit':
+        this.tone(0.25, 400, 200, 0.3, 'square');
         break;
       case 'ko':
         this.tone(1.2, 110, 30, 0.9);
@@ -123,7 +141,8 @@ export class Sfx {
         this.tone(0.3, 300, 600, 0.12, 'triangle');
         break;
       case 'jump':
-      case 'evade':
+      case 'dash':
+      case 'sidedash':
         this.burst(0.12, 1500, 1, 0.12, 'bandpass', 3000);
         break;
       case 'land':

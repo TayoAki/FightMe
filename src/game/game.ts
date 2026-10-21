@@ -4,8 +4,8 @@
 import { Devices } from '../input/devices';
 import { Renderer } from '../render/renderer';
 import { PALETTES } from '../render/rig';
-import { createMatch, resetPositions, step } from '../sim/match';
-import { STYLES } from '../sim/styles';
+import { createMatch, kitOf, resetPositions, step } from '../sim/match';
+import { STYLE_IDS } from '../sim/styles';
 import type { GameEvent, MatchState, StyleId, TrainingOptions } from '../sim/types';
 import { Hud } from '../ui/hud';
 import { ListScreen, SelectScreen, buildHowTo } from '../ui/screens';
@@ -17,9 +17,9 @@ type Screen = 'title' | 'select' | 'howto' | 'fight' | 'pause' | 'results';
 
 const DUMMY_MODES: Array<[TrainingOptions['dummy'], string]> = [
   ['stand', 'Stand'],
-  ['crouch', 'Crouch'],
-  ['block', 'Block all'],
-  ['blockAfterFirst', 'Block after first hit'],
+  ['guard', 'Guard all'],
+  ['guardAfterFirst', 'Guard after first hit'],
+  ['sidedash', 'Side dash'],
   ['jump', 'Jump'],
   ['cpu', 'CPU'],
 ];
@@ -150,13 +150,12 @@ export class Game {
   }
 
   private newAttract(): MatchState {
-    const styles: StyleId[] = ['street', 'iron'];
-    const a = styles[Math.floor(Math.random() * 2)];
-    const b = styles[Math.floor(Math.random() * 2)];
+    const a = STYLE_IDS[Math.floor(Math.random() * STYLE_IDS.length)];
+    const b = STYLE_IDS[Math.floor(Math.random() * STYLE_IDS.length)];
     const m = createMatch([a, b]);
     const pa = Math.floor(Math.random() * PALETTES.length);
     const pb = (pa + 1 + Math.floor(Math.random() * (PALETTES.length - 1))) % PALETTES.length;
-    this.renderer.setFighters([PALETTES[pa], PALETTES[pb]]);
+    this.renderer.setTeams([a, b], [pa, pb]);
     this.cpus.forEach((c) => {
       c.reset();
       c.level = 2;
@@ -171,7 +170,7 @@ export class Game {
     this.match = createMatch([picks[0].style, picks[1].style], training);
     let pb = picks[1].palette;
     if (pb === picks[0].palette) pb = (pb + 1) % PALETTES.length;
-    this.renderer.setFighters([PALETTES[picks[0].palette], PALETTES[pb]]);
+    this.renderer.setTeams([picks[0].style, picks[1].style], [picks[0].palette, pb]);
     this.cpus.forEach((c) => {
       c.reset();
       c.level = this.cpuLevel;
@@ -300,7 +299,7 @@ export class Game {
     m.fighters.forEach((f, i) => {
       const id = f.state === 'move' ? f.moveId : '';
       if (id && id !== this.prevMove[i] && this.mode !== 'attract') {
-        const mv = STYLES[f.style].moves[id];
+        const mv = kitOf(f).moves[id];
         if (mv.hitbox) this.sfx.whoosh(mv.damage >= 800 ? 3 : mv.damage >= 500 ? 2 : 1);
       }
       this.prevMove[i] = id;

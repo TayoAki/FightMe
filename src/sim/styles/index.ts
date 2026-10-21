@@ -1,7 +1,7 @@
 import type { StyleDef, StyleId } from '../types';
-import { IRON } from './iron';
 import { STREET } from './street';
+import { TAG } from './tag';
 
-export const STYLES: Record<StyleId, StyleDef> = { street: STREET, iron: IRON };
-export const STYLE_IDS: StyleId[] = ['street', 'iron'];
+export const STYLES: Record<StyleId, StyleDef> = { street: STREET, tag: TAG };
+export const STYLE_IDS: StyleId[] = ['street', 'tag'];
 export { totalFrames } from './build';

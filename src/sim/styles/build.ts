@@ -1,7 +1,7 @@
-import type { Box, MoveDef } from '../types';
+import type { HitBox, MoveDef } from '../types';
 
-// box(x0, x1, y0, y1): facing-relative, in sim units
-export const box = (x0: number, x1: number, y0: number, y1: number): Box => ({ x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+// hb(f0, f1, y0, y1, hw): reach f0..f1 in front of the fighter, height y0..y1, half width hw (sim units)
+export const hb = (f0: number, f1: number, y0: number, y1: number, hw = 3000): HitBox => ({ f0, f1, y0, y1, hw });
 
 type MoveInput = Partial<MoveDef> & Pick<MoveDef, 'name' | 'startup' | 'active' | 'recovery' | 'pose'>;
 
@@ -11,7 +11,6 @@ export function moves(table: Record<string, MoveInput>): Record<string, MoveDef>
     out[id] = {
       kind: 'normal',
       damage: 0,
-      height: 'high',
       onHit: 0,
       onBlock: 0,
       ...m,

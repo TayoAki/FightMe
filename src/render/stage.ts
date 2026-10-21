@@ -1,9 +1,10 @@
-// The arena: a neon rooftop at night. Everything is generated in code, no image files.
+// The arena: a round neon rooftop at night, with an energy fence at the edge and a skyline all the way
+// round, since the camera can face any direction. Everything is generated in code, no image files.
 
 import * as THREE from 'three';
-import { STAGE_HALF } from '../sim/constants';
+import { ARENA_R } from '../sim/constants';
 
-const WALL_X = STAGE_HALF / 10000;
+const R = ARENA_R / 10000;
 
 function canvasTexture(w: number, h: number, draw: (g: CanvasRenderingContext2D) => void) {
   const c = document.createElement('canvas');
@@ -16,9 +17,16 @@ function canvasTexture(w: number, h: number, draw: (g: CanvasRenderingContext2D)
   return t;
 }
 
-export function buildStage(scene: THREE.Scene) {
+export interface Stage {
+  key: THREE.DirectionalLight;
+  // brightens the fence segment nearest a point (wall splats)
+  flashFence(x: number, z: number): void;
+  update(frames: number): void;
+}
+
+export function buildStage(scene: THREE.Scene): Stage {
   scene.background = new THREE.Color('#07060f');
-  scene.fog = new THREE.Fog('#0b0818', 14, 60);
+  scene.fog = new THREE.Fog('#0b0818', 22, 90);
 
   // sky
   const sky = canvasTexture(16, 512, (g) => {
@@ -30,13 +38,13 @@ export function buildStage(scene: THREE.Scene) {
     g.fillStyle = grad;
     g.fillRect(0, 0, 16, 512);
   });
-  const skyMesh = new THREE.Mesh(new THREE.SphereGeometry(80, 32, 16), new THREE.MeshBasicMaterial({ map: sky, side: THREE.BackSide, fog: false }));
-  scene.add(skyMesh);
-  const moon = new THREE.Mesh(new THREE.CircleGeometry(3.2, 48), new THREE.MeshBasicMaterial({ color: '#ffd9b8', fog: false }));
-  moon.position.set(-14, 16, -55);
+  scene.add(new THREE.Mesh(new THREE.SphereGeometry(120, 32, 16), new THREE.MeshBasicMaterial({ map: sky, side: THREE.BackSide, fog: false })));
+  const moon = new THREE.Mesh(new THREE.CircleGeometry(4, 48), new THREE.MeshBasicMaterial({ color: '#ffd9b8', fog: false }));
+  moon.position.set(-30, 26, -80);
+  moon.lookAt(0, 0, 0);
   scene.add(moon);
 
-  // floor: dark tiles with glowing seams and a centre ring
+  // the platform: dark tiles with glowing seams in rings and spokes
   const floorTex = canvasTexture(1024, 1024, (g) => {
     g.fillStyle = '#14121d';
     g.fillRect(0, 0, 1024, 1024);
@@ -47,62 +55,58 @@ export function buildStage(scene: THREE.Scene) {
         g.fillRect(i * 64 + 2, j * 64 + 2, 60, 60);
       }
     }
-    g.strokeStyle = 'rgba(255,60,210,0.55)';
+    g.strokeStyle = 'rgba(255,60,210,0.45)';
     g.lineWidth = 3;
-    for (let i = 0; i <= 16; i += 4) {
+    for (const r of [140, 300, 460]) {
       g.beginPath();
-      g.moveTo(i * 64, 0);
-      g.lineTo(i * 64, 1024);
+      g.arc(512, 512, r, 0, Math.PI * 2);
+      g.stroke();
+    }
+    for (let k = 0; k < 8; k++) {
+      const a = (k / 8) * Math.PI * 2;
+      g.beginPath();
+      g.moveTo(512 + Math.cos(a) * 140, 512 + Math.sin(a) * 140);
+      g.lineTo(512 + Math.cos(a) * 500, 512 + Math.sin(a) * 500);
       g.stroke();
     }
   });
-  floorTex.wrapS = floorTex.wrapT = THREE.RepeatWrapping;
-  floorTex.repeat.set(3, 1.5);
-  const floor = new THREE.Mesh(
-    new THREE.PlaneGeometry(24, 12),
-    new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.42, metalness: 0.25 }),
-  );
+  const floor = new THREE.Mesh(new THREE.CircleGeometry(R + 0.6, 96), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.42, metalness: 0.25 }));
   floor.rotation.x = -Math.PI / 2;
-  floor.position.z = -1.5;
   floor.receiveShadow = true;
   scene.add(floor);
+  // the platform's edge, dropping away into the city
+  const rim = new THREE.Mesh(new THREE.CylinderGeometry(R + 0.6, R + 0.9, 2.5, 96, 1, true), new THREE.MeshStandardMaterial({ color: '#1a1530', roughness: 0.6, metalness: 0.4 }));
+  rim.position.y = -1.25;
+  scene.add(rim);
+  const centre = new THREE.Mesh(new THREE.RingGeometry(1.25, 1.33, 96), new THREE.MeshBasicMaterial({ color: '#5ff2ff', transparent: true, opacity: 0.5 }));
+  centre.rotation.x = -Math.PI / 2;
+  centre.position.y = 0.004;
+  scene.add(centre);
 
-  const ring = new THREE.Mesh(new THREE.RingGeometry(1.9, 1.98, 96), new THREE.MeshBasicMaterial({ color: '#ff3cd2', transparent: true, opacity: 0.55 }));
-  ring.rotation.x = -Math.PI / 2;
-  ring.position.y = 0.004;
-  scene.add(ring);
-  const line = new THREE.Mesh(new THREE.PlaneGeometry(WALL_X * 2, 0.04), new THREE.MeshBasicMaterial({ color: '#5ff2ff', transparent: true, opacity: 0.4 }));
-  line.rotation.x = -Math.PI / 2;
-  line.position.set(0, 0.005, 0.9);
-  scene.add(line);
-
-  // the walls at the stage edges: glowing barriers you can be splatted against
-  const barrierMat = new THREE.MeshStandardMaterial({ color: '#1a1530', emissive: '#ff3cd2', emissiveIntensity: 0.25, roughness: 0.3, metalness: 0.6, transparent: true, opacity: 0.85 });
-  const glowMat = new THREE.MeshBasicMaterial({ color: '#ff3cd2' });
-  for (const s of [-1, 1]) {
-    const x = s * (WALL_X + 0.05);
-    const pillar = new THREE.Mesh(new THREE.BoxGeometry(0.18, 2.6, 0.18), barrierMat);
-    pillar.position.set(x, 1.3, 0.7);
-    pillar.castShadow = true;
-    scene.add(pillar);
-    const pillar2 = pillar.clone();
-    pillar2.position.z = -1.2;
-    scene.add(pillar2);
-    const panel = new THREE.Mesh(
-      new THREE.PlaneGeometry(1.9, 2.4),
-      new THREE.MeshBasicMaterial({ color: '#ff3cd2', transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false }),
-    );
-    panel.rotation.y = Math.PI / 2;
-    panel.position.set(x, 1.2, -0.25);
-    scene.add(panel);
-    for (const y of [0.05, 2.6]) {
-      const bar = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.04, 1.95), glowMat);
-      bar.position.set(x, y, -0.25);
-      scene.add(bar);
-    }
+  // the energy fence: posts and a glowing band, low enough for the camera to see over
+  const postMat = new THREE.MeshStandardMaterial({ color: '#1a1530', emissive: '#ff3cd2', emissiveIntensity: 0.3, roughness: 0.3, metalness: 0.6 });
+  const segments = 32;
+  const bandMats: THREE.MeshBasicMaterial[] = [];
+  const flash = new Float32Array(segments);
+  for (let i = 0; i < segments; i++) {
+    const a0 = (i / segments) * Math.PI * 2;
+    const a1 = ((i + 1) / segments) * Math.PI * 2;
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 1.1, 8), postMat);
+    post.position.set(Math.cos(a0) * (R + 0.15), 0.55, Math.sin(a0) * (R + 0.15));
+    post.castShadow = true;
+    scene.add(post);
+    const mat = new THREE.MeshBasicMaterial({ color: '#ff3cd2', transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending });
+    bandMats.push(mat);
+    const band = new THREE.Mesh(new THREE.CylinderGeometry(R + 0.15, R + 0.15, 0.75, 4, 1, true, Math.PI / 2 - a1, a1 - a0), mat);
+    band.position.y = 0.6;
+    scene.add(band);
   }
+  const topRing = new THREE.Mesh(new THREE.TorusGeometry(R + 0.15, 0.025, 6, 160), new THREE.MeshBasicMaterial({ color: '#ff7ae0' }));
+  topRing.rotation.x = Math.PI / 2;
+  topRing.position.y = 1.1;
+  scene.add(topRing);
 
-  // skyline
+  // the skyline, all the way round
   const windows = canvasTexture(64, 128, (g) => {
     g.fillStyle = '#0d0b18';
     g.fillRect(0, 0, 64, 128);
@@ -117,63 +121,81 @@ export function buildStage(scene: THREE.Scene) {
     }
   });
   windows.wrapS = windows.wrapT = THREE.RepeatWrapping;
-  const bmat = new THREE.MeshBasicMaterial({ map: windows, color: '#c7b8ff' });
   let seed = 7;
-  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-  for (let i = 0; i < 70; i++) {
-    const w = 1.5 + rnd() * 3;
-    const h = 4 + rnd() * 18;
-    const d = 1.5 + rnd() * 3;
-    const geo = new THREE.BoxGeometry(w, h, d);
-    const mat = bmat.clone();
-    mat.map = windows.clone();
-    mat.map.repeat.set(Math.max(1, Math.round(w / 1.2)), Math.max(1, Math.round(h / 2.4)));
-    mat.map.needsUpdate = true;
-    const b = new THREE.Mesh(geo, mat);
-    const row = i % 3;
-    b.position.set((rnd() - 0.5) * 90, h / 2 - 6, -18 - row * 9 - rnd() * 6);
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 110; i++) {
+    const w = 2 + rnd() * 4;
+    const h = 6 + rnd() * 26;
+    const d = 2 + rnd() * 4;
+    const map = windows.clone();
+    map.repeat.set(Math.max(1, Math.round(w / 1.2)), Math.max(1, Math.round(h / 2.4)));
+    map.needsUpdate = true;
+    const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshBasicMaterial({ map, color: '#c7b8ff' }));
+    const a = rnd() * Math.PI * 2;
+    const dist = 26 + rnd() * 34;
+    b.position.set(Math.cos(a) * dist, h / 2 - 10, Math.sin(a) * dist);
+    b.rotation.y = -a;
     scene.add(b);
   }
-  // a big neon sign
-  const sign = canvasTexture(1024, 256, (g) => {
-    g.clearRect(0, 0, 1024, 256);
-    g.font = 'bold 170px "Arial Black", Impact, sans-serif';
-    g.textAlign = 'center';
-    g.textBaseline = 'middle';
-    g.shadowColor = '#ff3cd2';
-    g.shadowBlur = 40;
-    g.fillStyle = '#ff7ae0';
-    g.fillText('FIGHTME', 512, 132);
-    g.shadowBlur = 0;
-    g.strokeStyle = '#ffffff';
-    g.lineWidth = 4;
-    g.strokeText('FIGHTME', 512, 132);
-  });
-  const signMesh = new THREE.Mesh(new THREE.PlaneGeometry(9, 2.25), new THREE.MeshBasicMaterial({ map: sign, transparent: true, depthWrite: false, fog: false }));
-  signMesh.position.set(10.5, 4.6, -19);
-  signMesh.rotation.y = -0.35;
-  scene.add(signMesh);
+  // neon signs on a few rooftops
+  const sign = (text: string, color: string) =>
+    canvasTexture(1024, 256, (g) => {
+      g.font = 'bold 170px "Arial Black", Impact, sans-serif';
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.shadowColor = color;
+      g.shadowBlur = 40;
+      g.fillStyle = color;
+      g.fillText(text, 512, 132);
+      g.shadowBlur = 0;
+      g.strokeStyle = '#ffffff';
+      g.lineWidth = 4;
+      g.strokeText(text, 512, 132);
+    });
+  for (const [text, color, a] of [
+    ['FIGHTME', '#ff7ae0', 0.4],
+    ['ARENA', '#5ff2ff', 2.6],
+    ['FIGHTME', '#ffd34d', 4.4],
+  ] as const) {
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(11, 2.75), new THREE.MeshBasicMaterial({ map: sign(text, color), transparent: true, depthWrite: false, fog: false }));
+    mesh.position.set(Math.cos(a) * 30, 9, Math.sin(a) * 30);
+    mesh.lookAt(0, 9, 0);
+    scene.add(mesh);
+  }
 
   // lights
-  scene.add(new THREE.HemisphereLight('#8a7dff', '#1d0f22', 0.65));
+  scene.add(new THREE.HemisphereLight('#8a7dff', '#1d0f22', 0.7));
   const key = new THREE.DirectionalLight('#fff1e0', 2.4);
-  key.position.set(2.5, 7, 6);
+  key.position.set(4, 12, 7);
   key.castShadow = true;
   key.shadow.mapSize.set(2048, 2048);
-  key.shadow.camera.left = -7;
-  key.shadow.camera.right = 7;
-  key.shadow.camera.top = 6;
-  key.shadow.camera.bottom = -2;
+  for (const k of ['left', 'bottom'] as const) key.shadow.camera[k] = -R - 1;
+  for (const k of ['right', 'top'] as const) key.shadow.camera[k] = R + 1;
   key.shadow.camera.near = 1;
-  key.shadow.camera.far = 25;
+  key.shadow.camera.far = 40;
   key.shadow.bias = -0.0004;
   scene.add(key);
   scene.add(key.target);
-  const rimL = new THREE.DirectionalLight('#ff3cd2', 1.4);
-  rimL.position.set(-6, 3, -4);
+  const rimL = new THREE.DirectionalLight('#ff3cd2', 1.3);
+  rimL.position.set(-8, 4, -6);
   scene.add(rimL);
-  const rimR = new THREE.DirectionalLight('#38d9ff', 1.4);
-  rimR.position.set(6, 3, -4);
+  const rimR = new THREE.DirectionalLight('#38d9ff', 1.3);
+  rimR.position.set(8, 4, -6);
   scene.add(rimR);
-  return { key };
+
+  return {
+    key,
+    flashFence(x: number, z: number) {
+      let a = Math.atan2(z, x);
+      if (a < 0) a += Math.PI * 2;
+      const i = Math.floor((a / (Math.PI * 2)) * segments) % segments;
+      for (const d of [-1, 0, 1]) flash[(i + d + segments) % segments] = d === 0 ? 1 : 0.6;
+    },
+    update(frames: number) {
+      for (let i = 0; i < segments; i++) {
+        if (flash[i] > 0) flash[i] = Math.max(0, flash[i] - frames * 0.03);
+        bandMats[i].opacity = 0.08 + flash[i] * 0.7;
+      }
+    },
+  };
 }

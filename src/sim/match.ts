@@ -1,54 +1,69 @@
-// The deterministic match simulation. `step` advances one frame from both players' raw inputs. It uses
+// The deterministic arena simulation. `step` advances one frame from both players' raw inputs. It uses
 // integer arithmetic on plain data only, so the same inputs always give the same state.
+//
+// Fighters move freely on a round arena and always face each other (lock-on). The stick is read against
+// the shared camera's view (m.ax, m.az), which the simulation keeps itself so input and camera agree.
 
 import {
+  ARENA_R,
+  ASSIST_COOLDOWN,
+  ASSIST_HIT_COOLDOWN,
+  AIRDASH_FRAMES,
+  AIRDASH_SPEED,
   BACKDASH_FRAMES,
+  BACKDASH_INVULN,
   BACKDASH_SPEED,
+  BODY_R,
+  CLASH_FRAMES,
+  CLASH_PUSH,
   CRUMPLE_FRAMES,
-  CROUCH_HEIGHT,
-  DASH_FRAMES,
+  DASH_MAX,
+  DASH_MOMENTUM,
+  DASH_RECOVERY,
   DASH_SPEED,
+  DASH_STOP,
   DIZZY_FRAMES,
   DRIVE_BAR,
   DRIVE_MAX,
   DRIVE_REGEN,
   DRIVE_REGEN_BURNOUT,
   DRIVE_RUSH_BONUS,
+  FPS,
   GETUP_FRAMES,
   GRAVITY,
+  GUARD_ARC,
   JUGGLE_GRAVITY,
-  HEAT_FRAMES,
   JUMP_VY,
   KNOCKDOWN_FRAMES,
   LANDING,
-  MAX_HEALTH,
-  MAX_SEPARATION,
   PARRY_DRAIN,
   PREJUMP,
-  PUSH_HALF,
-  PUSH_HALF_AIR,
-  RAGE_THRESHOLD,
   ROUNDS_TO_WIN,
   ROUND_SECONDS,
   SCALING,
-  STAGE_HALF,
+  SIDEDASH_FRAMES,
+  SIDEDASH_INVULN,
+  SIDEDASH_SPEED,
   STAND_HEIGHT,
   START_GAP,
-  SUPER_BAR,
   SUPER_MAX,
+  TAG_COOLDOWN,
   THROW_PROTECT,
   THROW_TECH_WINDOW,
   WALLSPLAT_FRAMES,
-  FPS,
+  JUMP_SPEED,
 } from './constants';
-import { BUTTONS, IN, PRESS_BUFFER, findPress, isBack, isDown, isForward, isUp, matchMotion, pushInput } from './input';
+import { ATTACKS, IN, PRESS_BUFFER, findPress, pushInput } from './input';
 import { STYLES, totalFrames } from './styles';
 import type {
-  Box,
+  AssistState,
+  BeamState,
   CommandDef,
-  Facing,
+  CommandFrom,
   FighterState,
   GameEventType,
+  HitBox,
+  Kit,
   MatchState,
   MoveDef,
   ProjectileState,
@@ -56,51 +71,53 @@ import type {
   StyleId,
   TrainingOptions,
 } from './types';
+import { ONE, dotU, isqrt, len, norm, pointSegDist, scale, turnToward } from './vec';
 
-const MP = IN.B2, MK = IN.B5;
-const THROW_BUTTONS = IN.B1 | IN.B4;
-const HEAVY_FIRST = [IN.B3, IN.B6, IN.B2, IN.B5, IN.B1, IN.B4];
+const { L, H, G, D, J } = IN;
+// fighters stop this far inside the fence
+const LIM = ARENA_R - BODY_R;
 
 export const styleOf = (f: FighterState): StyleDef => STYLES[f.style];
-export const moveOf = (f: FighterState): MoveDef => STYLES[f.style].moves[f.moveId];
+export const kitOf = (f: FighterState): Kit => STYLES[f.style].kits[f.char];
+export const moveOf = (f: FighterState): MoveDef => kitOf(f).moves[f.moveId];
+export const assistMove = (m: MatchState, a: AssistState): MoveDef => STYLES[m.fighters[a.side].style].kits[a.char].moves[a.moveId];
 
 export function createFighter(side: 0 | 1, style: StyleId): FighterState {
   return {
     side,
     style,
+    char: 0,
     x: side === 0 ? -START_GAP / 2 : START_GAP / 2,
+    z: 0,
     y: 0,
     vx: 0,
+    vz: 0,
     vy: 0,
-    facing: side === 0 ? 1 : -1,
-    health: MAX_HEALTH,
+    fx: side === 0 ? ONE : -ONE,
+    fz: 0,
+    health: STYLES[style].health,
     drive: DRIVE_MAX,
     superMeter: 0,
     burnout: false,
-    heatAvailable: true,
-    heatTimer: 0,
-    rageUsed: false,
     state: 'idle',
     stateFrame: 0,
     moveId: '',
     moveFrame: 0,
     moveStartF: 0,
-    hitIndex: 0,
     hitConnected: 0,
     contact: '',
     contactF: 0,
     stun: 0,
     kb: 0,
-    kbDir: 1,
-    jumpDir: 0,
+    kbx: 0,
+    kbz: 0,
+    dashSide: 1,
     airUsed: false,
-    crouching: false,
-    blockHeight: '',
+    airDashed: false,
     armorLeft: 0,
-    driveRushBuff: 0,
     fromDriveRush: false,
+    fromDash: false,
     juggleCount: 0,
-    tornadoUsed: false,
     comboHits: 0,
     comboDamage: 0,
     comboScale50: false,
@@ -115,6 +132,8 @@ export function createFighter(side: 0 | 1, style: StyleId): FighterState {
     roundWins: 0,
     actionableSince: 0,
     wasActionable: true,
+    assistCD: 0,
+    tagCD: 0,
     hist: [],
   };
 }
@@ -128,8 +147,13 @@ export function createMatch(styles: [StyleId, StyleId], training: TrainingOption
     round: 1,
     timer: ROUND_SECONDS * FPS,
     winner: -1,
+    ax: ONE,
+    az: 0,
     fighters: [createFighter(0, styles[0]), createFighter(1, styles[1])],
+    assists: [null, null],
     projectiles: [],
+    beams: [],
+    clash: null,
     events: [],
     training,
     lastMove: ['', ''],
@@ -142,7 +166,7 @@ export function createMatch(styles: [StyleId, StyleId], training: TrainingOption
 export const cloneMatch = (m: MatchState): MatchState => structuredClone(m);
 
 export function hashMatch(m: MatchState): number {
-  const s = JSON.stringify([m.frame, m.freeze, m.phase, m.timer, m.fighters, m.projectiles]);
+  const s = JSON.stringify([m.frame, m.freeze, m.phase, m.timer, m.ax, m.az, m.fighters, m.assists, m.projectiles, m.beams, m.clash]);
   let h = 0x811c9dc5;
   for (let i = 0; i < s.length; i++) {
     h ^= s.charCodeAt(i);
@@ -151,22 +175,35 @@ export function hashMatch(m: MatchState): number {
   return h >>> 0;
 }
 
-function emit(m: MatchState, type: GameEventType, f: FighterState, power = 1, text?: string, x = f.x, y = f.y + 12000) {
-  m.events.push({ type, side: f.side, x, y, power, text });
+function emit(m: MatchState, type: GameEventType, side: 0 | 1, x: number, y: number, z: number, power = 1, text?: string) {
+  m.events.push({ type, side, x, y, z, power, text });
 }
+const emitAt = (m: MatchState, type: GameEventType, f: FighterState, power = 1, text?: string) => emit(m, type, f.side, f.x, f.y + 12000, f.z, power, text);
 
 // ---------------------------------------------------------------------------------------------- geometry
 
-export function toWorld(f: FighterState, b: Box): Box {
-  const x = f.facing === 1 ? f.x + b.x : f.x - (b.x + b.w);
-  return { x, y: f.y + b.y, w: b.w, h: b.h };
+interface Actor {
+  x: number;
+  z: number;
+  y: number;
+  fx: number;
+  fz: number;
 }
 
-const overlap = (a: Box, b: Box) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+interface Hurt {
+  x: number;
+  z: number;
+  r: number;
+  y0: number;
+  y1: number;
+}
+
+// unit vector from a toward b
+const toward = (a: { x: number; z: number; fx: number; fz: number }, b: { x: number; z: number }) => norm(b.x - a.x, b.z - a.z, a.fx, a.fz);
 
 const airborne = (f: FighterState) => f.y > 0 || f.vy > 0;
 
-export function hurtboxes(f: FighterState): Box[] {
+export function hurtboxes(f: FighterState): Hurt[] {
   switch (f.state) {
     case 'knockdown':
     case 'getup':
@@ -175,45 +212,65 @@ export function hurtboxes(f: FighterState): Box[] {
     case 'throwing':
       return [];
     case 'juggle':
-      return [toWorld(f, { x: -2600, y: 0, w: 5200, h: 9000 })];
+      // a body tumbling in the air: generous, so standing attacks keep a juggle going
+      return [{ x: f.x, z: f.z, r: 3000, y0: Math.max(0, f.y - 5000), y1: f.y + 9000 }];
   }
-  const out: Box[] = [];
-  if (airborne(f)) {
-    out.push(toWorld(f, { x: -1800, y: 1500, w: 3600, h: 13500 }));
-  } else {
-    let bottom = 0;
-    if (f.state === 'move') {
-      const mv = moveOf(f);
-      if (mv.airborne && f.moveFrame >= mv.airborne[0] && f.moveFrame <= mv.airborne[1]) bottom = 4500;
-    }
-    const h = f.crouching ? CROUCH_HEIGHT : STAND_HEIGHT;
-    out.push(toWorld(f, { x: -2000, y: bottom, w: 4000, h: h - bottom }));
-  }
+  if (airborne(f)) return [{ x: f.x, z: f.z, r: BODY_R, y0: f.y + 1500, y1: f.y + 15000 }];
+  let bottom = 0;
+  const out: Hurt[] = [];
   if (f.state === 'move') {
     const mv = moveOf(f);
-    if (mv.hurtbox) out.push(toWorld(f, mv.hurtbox));
+    if (mv.airborne && f.moveFrame >= mv.airborne[0] && f.moveFrame <= mv.airborne[1]) bottom = 4500;
+  }
+  out.push({ x: f.x, z: f.z, r: BODY_R, y0: f.y + bottom, y1: f.y + STAND_HEIGHT });
+  if (f.state === 'move') {
     // limbs stick out from just before the hit until halfway through recovery: whiffs can be punished
-    const hb = mv.hitbox;
-    if (hb && mv.kind !== 'throw' && f.moveFrame >= mv.startup - 2 && f.moveFrame <= mv.startup + mv.active + (mv.recovery >> 1)) {
-      const reach = hb.x + hb.w - 900;
-      if (reach > 2000) out.push(toWorld(f, { x: 1500, y: hb.y + 300, w: reach - 1500, h: Math.max(1500, hb.h - 600) }));
+    const mv = moveOf(f);
+    const box = mv.hitbox;
+    if (box && mv.kind !== 'throw' && f.moveFrame >= mv.startup - 2 && f.moveFrame <= mv.startup + mv.active + (mv.recovery >> 1)) {
+      const reach = box.f1 - 900;
+      if (reach > 2600) {
+        const d = Math.trunc(reach * 0.6);
+        out.push({ x: f.x + scale(d, f.fx), z: f.z + scale(d, f.fz), r: 2000, y0: f.y + box.y0, y1: f.y + box.y1 });
+      }
     }
   }
   return out;
 }
 
-function pushHalf(f: FighterState) {
-  return airborne(f) ? PUSH_HALF_AIR : PUSH_HALF;
+const assistHurt = (a: AssistState): Hurt => ({ x: a.x, z: a.z, r: BODY_R, y0: a.y, y1: a.y + STAND_HEIGHT });
+
+function hitTest(att: Actor, box: HitBox, h: Hurt): boolean {
+  const rx = h.x - att.x;
+  const rz = h.z - att.z;
+  const fwd = scale(rx, att.fx) + scale(rz, att.fz);
+  if (fwd < box.f0 - h.r || fwd > box.f1 + h.r) return false;
+  const lat = scale(rx, att.fz) - scale(rz, att.fx);
+  if (Math.abs(lat) > box.hw + h.r) return false;
+  const y0 = att.y + box.y0;
+  const y1 = att.y + box.y1;
+  return y0 < h.y1 && h.y0 < y1;
 }
 
-function pushSpan(f: FighterState): [number, number] {
-  if (airborne(f)) return [f.y + 4000, f.y + 14000];
-  if (f.state === 'knockdown' || f.state === 'ko') return [0, 4000];
-  return [0, f.crouching ? CROUCH_HEIGHT : STAND_HEIGHT];
+// keep a point inside the fence; true when it had to be pulled back
+function clampArena(p: { x: number; z: number }): boolean {
+  const d = len(p.x, p.z);
+  if (d <= LIM) return false;
+  p.x = Math.trunc((p.x * LIM) / d);
+  p.z = Math.trunc((p.z * LIM) / d);
+  return true;
 }
 
-const WALL = STAGE_HALF - PUSH_HALF;
-const atWall = (f: FighterState, dir: Facing) => (dir === 1 ? f.x >= WALL - 400 : f.x <= -WALL + 400);
+// how far p can travel along the unit vector (dx, dz) before reaching the fence
+function roomToWall(p: { x: number; z: number }, dx: number, dz: number): number {
+  const b = scale(p.x, dx) + scale(p.z, dz);
+  const c = p.x * p.x + p.z * p.z - LIM * LIM;
+  const disc = b * b - c;
+  if (disc < 0) return 0;
+  return Math.max(0, -b + isqrt(disc));
+}
+
+const atWall = (f: FighterState) => len(f.x, f.z) >= LIM - 600;
 
 // ---------------------------------------------------------------------------------------------- state helpers
 
@@ -224,35 +281,36 @@ function setState(f: FighterState, s: FighterState['state']) {
 }
 
 export function actionable(f: FighterState) {
-  return f.state === 'idle' || f.state === 'walkF' || f.state === 'walkB' || f.state === 'crouch';
+  return f.state === 'idle' || f.state === 'run' || f.state === 'guard';
 }
 
 const inHitState = (f: FighterState) =>
   f.state === 'hitstun' || f.state === 'juggle' || f.state === 'wallsplat' || f.state === 'crumple' || f.state === 'stagger';
 
-const rageActive = (f: FighterState) => styleOf(f).rage && !f.rageUsed && f.health > 0 && f.health <= RAGE_THRESHOLD;
-
 function endMove(f: FighterState) {
   setState(f, 'idle');
-  f.moveId = '';
   f.moveFrame = 0;
   f.fromDriveRush = false;
-  f.crouching = false;
+  f.fromDash = false;
+}
+
+function face(f: FighterState, o: FighterState) {
+  const [ux, uz] = toward(f, o);
+  f.fx = ux;
+  f.fz = uz;
 }
 
 function startMove(m: MatchState, f: FighterState, o: FighterState, id: string, cmd?: CommandDef) {
-  const st = styleOf(f);
-  const mv = st.moves[id];
-  const prevDR = f.state === 'move' && moveOf(f).tag === 'driveRush';
-  if (id === 'dash' || id === 'backdash') {
-    setState(f, id);
-    f.lastConsumed = m.frame;
+  if (id === '@tag') {
+    tagSwap(m, f, o);
     return;
   }
+  const st = styleOf(f);
+  const mv = kitOf(f).moves[id];
+  const prevDR = f.state === 'move' && moveOf(f).tag === 'driveRush';
   if (id === 'parry') {
     if (f.burnout || f.drive <= 0) return;
     setState(f, 'parry');
-    f.crouching = false;
     f.lastConsumed = m.frame;
     m.lastMove[f.side] = mv.name;
     return;
@@ -263,12 +321,14 @@ function startMove(m: MatchState, f: FighterState, o: FighterState, id: string, 
   }
   if (cmd?.cost?.super) f.superMeter -= cmd.cost.super;
   if (!mv.air) {
-    f.facing = o.x >= f.x ? 1 : -1;
-    f.vx = 0;
+    face(f, o);
+    if (!airborne(f)) {
+      f.vx = 0;
+      f.vz = 0;
+    }
   }
-  const dir = f.hist[f.hist.length - 1].dir;
-  f.crouching = !mv.air && st.normals.crouch && Object.values(st.normals.crouch).includes(id);
-  f.throwBack = mv.kind === 'throw' && isBack(dir);
+  const idx = f.hist.length - 1;
+  f.throwBack = mv.kind === 'throw' && f.hist[idx].rel === 'a';
   setState(f, 'move');
   f.moveId = id;
   f.moveFrame = 0;
@@ -276,78 +336,150 @@ function startMove(m: MatchState, f: FighterState, o: FighterState, id: string, 
   f.hitConnected = 0;
   f.contact = '';
   f.armorLeft = mv.armor ?? 0;
-  f.fromDriveRush = prevDR && mv.kind === 'normal';
+  f.fromDriveRush = prevDR && (mv.kind === 'normal' || mv.kind === 'throw');
+  f.fromDash = false;
   f.lastConsumed = m.frame;
   if (mv.air) f.airUsed = true;
   m.lastMove[f.side] = mv.name;
   if (mv.superFreeze) {
     m.freeze = mv.superFreeze;
-    emit(m, mv.kind === 'super' ? 'super' : mv.tag === 'heatSmash' ? 'heatSmash' : 'heat', f, mv.superFreeze, mv.name);
+    emitAt(m, 'super', f, mv.superFreeze, mv.name);
+    // the Tag team super brings the partner in too
+    if (st.team && !m.assists[f.side]) spawnAssist(m, f, o, true);
   }
-  if (mv.tag === 'heatBurst') {
-    f.heatAvailable = false;
-    f.heatTimer = HEAT_FRAMES;
-  }
-  if (mv.tag === 'heatSmash') f.heatTimer = 0;
-  if (mv.tag === 'rageArt') {
-    f.rageUsed = true;
-    emit(m, 'rageArt', f, 1, mv.name);
-  }
-  if (mv.tag === 'driveRush') emit(m, 'driveRush', f);
-  if (mv.tag === 'driveImpact') emit(m, 'driveImpact', f);
-  if (mv.tag === 'justFrame') emit(m, 'justFrame', f, 1, 'PERFECT');
-  if (mv.tag === 'evade') emit(m, 'evade', f);
+  if (mv.tag === 'driveRush') emitAt(m, 'driveRush', f);
+  if (mv.tag === 'driveImpact') emitAt(m, 'driveImpact', f);
 }
 
 function enterBurnout(m: MatchState, f: FighterState) {
   f.drive = 0;
   if (!f.burnout) {
     f.burnout = true;
-    emit(m, 'burnout', f, 1, 'BURNOUT');
+    emitAt(m, 'burnout', f, 1, 'BURNOUT');
   }
+}
+
+// ---------------------------------------------------------------------------------------------- Tag team
+
+function canCallAssist(m: MatchState, f: FighterState) {
+  if (!styleOf(f).team || m.assists[f.side] || f.assistCD > 0) return false;
+  switch (f.state) {
+    case 'idle':
+    case 'run':
+    case 'guard':
+    case 'move':
+    case 'dash':
+    case 'dashEnd':
+    case 'air':
+    case 'airdash':
+    case 'land':
+    case 'prejump':
+      return true;
+  }
+  return false;
+}
+
+function spawnAssist(m: MatchState, f: FighterState, o: FighterState, free: boolean) {
+  const char = (1 - f.char) as 0 | 1;
+  const kit = styleOf(f).kits[char];
+  const [ux, uz] = toward(f, o);
+  // jump in beside the point, on the camera's side so they stay in view: toward the camera is (-az, ax)
+  const a: AssistState = {
+    side: f.side,
+    char,
+    state: 'enter',
+    stateFrame: 0,
+    x: f.x + scale(9000, -m.az) - scale(3000, ux),
+    z: f.z + scale(9000, m.ax) - scale(3000, uz),
+    y: 0,
+    vx: 0,
+    vz: 0,
+    vy: 700,
+    fx: ux,
+    fz: uz,
+    moveId: kit.assist!,
+    moveFrame: 0,
+    hitConnected: 0,
+  };
+  clampArena(a);
+  m.assists[f.side] = a;
+  if (!free) f.assistCD = 1;
+  emit(m, 'assist', f.side, a.x, 12000, a.z, 1, kit.name.toUpperCase());
+}
+
+function advanceAssist(m: MatchState, a: AssistState) {
+  const owner = m.fighters[a.side];
+  const opp = m.fighters[1 - a.side];
+  a.stateFrame++;
+  const done = (cooldown: number) => {
+    m.assists[a.side] = null;
+    owner.assistCD = cooldown;
+  };
+  switch (a.state) {
+    case 'enter':
+      a.y = Math.max(0, a.y + a.vy);
+      a.vy -= 180;
+      if (a.stateFrame >= 8) {
+        a.y = 0;
+        a.state = 'attack';
+        a.stateFrame = 0;
+        a.moveFrame = 0;
+        const [ux, uz] = toward(a, opp);
+        a.fx = ux;
+        a.fz = uz;
+      }
+      break;
+    case 'attack': {
+      const mv = assistMove(m, a);
+      a.moveFrame++;
+      const t = a.moveFrame;
+      if (mv.homing && t <= mv.homing) {
+        const [ux, uz] = toward(a, opp);
+        turnToward(a, ux, uz, 10);
+      }
+      for (const seg of mv.velocity ?? []) {
+        if (t < seg.from || t > seg.to) continue;
+        a.x += scale(seg.fwd, a.fx);
+        a.z += scale(seg.fwd, a.fz);
+      }
+      clampArena(a);
+      if (mv.projectile && t === mv.startup) spawnProjectile(m, a.side, a.char, mv, a, opp);
+      if (mv.beam && t === mv.startup) spawnBeam(m, a.side, a.char, mv, a, opp, true);
+      if (t >= totalFrames(mv)) {
+        a.state = 'leave';
+        a.stateFrame = 0;
+      }
+      break;
+    }
+    case 'leave':
+      a.y += 900 - a.stateFrame * 40;
+      a.x -= scale(400, a.fx);
+      a.z -= scale(400, a.fz);
+      if (a.stateFrame >= 16) done(ASSIST_COOLDOWN);
+      break;
+    case 'hit':
+      a.x += a.vx;
+      a.z += a.vz;
+      a.y += a.vy;
+      a.vy -= GRAVITY;
+      clampArena(a);
+      if ((a.y <= 0 && a.stateFrame > 6) || a.stateFrame >= 50) done(ASSIST_HIT_COOLDOWN);
+      break;
+  }
+}
+
+function tagSwap(m: MatchState, f: FighterState, o: FighterState) {
+  const leaving = kitOf(f).name;
+  f.char = (1 - f.char) as 0 | 1;
+  f.tagCD = TAG_COOLDOWN;
+  setState(f, 'idle');
+  emitAt(m, 'tagSwap', f, 1, `${leaving.toUpperCase()} → ${kitOf(f).name.toUpperCase()}`);
+  startMove(m, f, o, kitOf(f).tagIn!);
 }
 
 // ---------------------------------------------------------------------------------------------- input → action
 
-type Ctx = 'ground' | 'parry' | 'blockstun' | 'prejump' | 'cancel' | 'driveRush' | 'kara';
-
-function findCommand(f: FighterState, ctx: Ctx, opts: { kinds?: string[]; buffer?: number } = {}): CommandDef | null {
-  const st = styleOf(f);
-  const hist = f.hist;
-  const n = hist.length - 1;
-  const buffer = opts.buffer ?? PRESS_BUFFER;
-  for (const cmd of st.commands) {
-    const mv = st.moves[cmd.move];
-    const from = cmd.from ?? 'ground';
-    if (ctx === 'cancel' || ctx === 'driveRush' || ctx === 'kara') {
-      if (from !== 'ground') continue;
-      if (opts.kinds && !opts.kinds.includes(mv.kind)) continue;
-      if (ctx === 'kara' && popcount(cmd.buttons) < 2) continue;
-    } else if (from !== ctx) continue;
-    if (cmd.needs === 'heat' && f.heatTimer <= 0) continue;
-    if (cmd.needs === 'heatAvailable' && !(f.heatAvailable && f.heatTimer <= 0)) continue;
-    if (cmd.needs === 'rage' && !rageActive(f)) continue;
-    if (cmd.cost?.drive && (f.burnout || f.drive <= 0)) continue;
-    if (cmd.cost?.super && f.superMeter < cmd.cost.super) continue;
-    if (cmd.move === 'parry' && (f.burnout || f.drive <= 0)) continue;
-    if (cmd.buttons === 0) {
-      if (!cmd.motion || matchMotion(hist, cmd.motion, n) < 0) continue;
-      return cmd;
-    }
-    const idx = findPress(hist, cmd.buttons, !!cmd.any, buffer, f.lastConsumed);
-    if (idx < 0) continue;
-    if (cmd.dirs && !cmd.dirs.includes(hist[idx].dir)) continue;
-    if (cmd.motion) {
-      const last = matchMotion(hist, cmd.motion, idx);
-      if (last < 0) continue;
-      if (cmd.justFrame && last !== idx) continue;
-      // 2-3-6 rolled into a press also reads as 6-2-3: when the stick ends forward, it's the quarter circle
-      if (cmd.motion === '623' && hist[idx].dir === 6 && matchMotion(hist, '236', idx) >= 0) continue;
-    }
-    return cmd;
-  }
-  return null;
-}
+type Ctx = CommandFrom | 'cancel' | 'driveRush' | 'kara';
 
 function popcount(x: number) {
   let c = 0;
@@ -358,91 +490,136 @@ function popcount(x: number) {
   return c;
 }
 
-// the newest button press within the buffer, heaviest first when several land on one frame
-function newestButton(f: FighterState, buffer = PRESS_BUFFER): number {
-  const hist = f.hist;
-  for (let i = hist.length - 1; i >= Math.max(0, hist.length - buffer); i--) {
-    const h = hist[i];
-    if (h.f <= f.lastConsumed) break;
-    if (h.pressed & BUTTONS) {
-      for (const b of HEAVY_FIRST) if (h.pressed & b) return b;
-    }
-  }
-  return 0;
+function commandKind(kit: Kit, cmd: CommandDef) {
+  return cmd.move === '@tag' ? 'tag' : kit.moves[cmd.move].kind;
 }
 
-function normalFor(f: FighterState, button: number, stance: 'stand' | 'crouch' | 'air'): string | undefined {
-  return styleOf(f).normals[stance][button];
+function findCommand(f: FighterState, ctx: Ctx, opts: { kinds?: string[]; buffer?: number } = {}): CommandDef | null {
+  const st = styleOf(f);
+  const kit = kitOf(f);
+  const hist = f.hist;
+  const buffer = opts.buffer ?? PRESS_BUFFER;
+  const lists = ctx === 'air' ? [kit.air] : [st.commands, kit.commands];
+  for (const list of lists) {
+    for (const cmd of list) {
+      const from = cmd.from ?? (ctx === 'air' ? 'air' : 'ground');
+      if (ctx === 'cancel' || ctx === 'driveRush' || ctx === 'kara') {
+        if (from !== 'ground') continue;
+        if (opts.kinds && !opts.kinds.includes(commandKind(kit, cmd))) continue;
+        if (ctx === 'kara' && popcount(cmd.buttons) < 2) continue;
+      } else if (from !== ctx) continue;
+      if (cmd.needs === 'tag' && (!st.team || f.tagCD > 0)) continue;
+      if (cmd.cost?.drive && (f.burnout || f.drive <= 0)) continue;
+      if (cmd.cost?.super && f.superMeter < cmd.cost.super) continue;
+      if (cmd.move === 'parry' && (f.burnout || f.drive <= 0)) continue;
+      const idx = findPress(hist, cmd.buttons, !!cmd.any, buffer, f.lastConsumed);
+      if (idx < 0) continue;
+      if (cmd.rel && !cmd.rel.includes(hist[idx].rel)) continue;
+      return cmd;
+    }
+  }
+  return null;
+}
+
+const pressed = (f: FighterState, mask: number, buffer = PRESS_BUFFER) => findPress(f.hist, mask, true, buffer, f.lastConsumed);
+
+function groundAttack(m: MatchState, f: FighterState, o: FighterState): boolean {
+  const c = findCommand(f, 'ground');
+  if (!c) return false;
+  const fromDash = f.state === 'dash' || f.state === 'dashEnd';
+  startMove(m, f, o, c.move, c);
+  if (fromDash && f.state === 'move') f.fromDash = true;
+  return true;
+}
+
+function startDash(m: MatchState, f: FighterState, idx: number) {
+  const h = f.hist[idx];
+  f.lastConsumed = m.frame;
+  if (h.rel === 'a') {
+    setState(f, 'backdash');
+  } else if (h.rel === 's') {
+    setState(f, 'sidedash');
+    f.dashSide = h.side === -1 ? -1 : 1;
+    emitAt(m, 'sidedash', f);
+    return;
+  } else setState(f, 'dash');
+  emitAt(m, 'dash', f);
 }
 
 function control(m: MatchState, f: FighterState, o: FighterState) {
-  const st = styleOf(f);
   const cur = f.hist[f.hist.length - 1];
+  // Tag: the partner can be called in at almost any time, even in the middle of your own move
+  if (canCallAssist(m, f) && findPress(f.hist, L | H, false, PRESS_BUFFER, f.lastConsumed) >= 0) {
+    // a light attack started by the first half of the chord is cancelled
+    if (f.state === 'move' && f.moveFrame <= 2 && moveOf(f).kind === 'normal') endMove(f);
+    spawnAssist(m, f, o, false);
+    f.lastConsumed = m.frame;
+    return;
+  }
   switch (f.state) {
-    case 'parry': {
-      const c = findCommand(f, 'parry');
-      if (c) {
-        startMove(m, f, o, c.move, c);
+    case 'parry':
+      if (pressed(f, D) >= 0 && !f.burnout && f.drive > 0) {
+        startMove(m, f, o, 'drive_rush', { move: 'drive_rush', buttons: D, cost: { drive: DRIVE_BAR } });
         return;
       }
-      if ((cur.held & (MP | MK)) !== (MP | MK) && f.stateFrame >= 6) {
+      if ((cur.held & (L | H)) !== (L | H) && f.stateFrame >= 6) {
         setState(f, 'parryEnd');
         f.stun = 6;
       }
       return;
-    }
     case 'blockstun': {
       const c = findCommand(f, 'blockstun');
       if (c) startMove(m, f, o, c.move, c);
       return;
     }
-    case 'thrown': {
-      if (f.stateFrame <= THROW_TECH_WINDOW && findPress(f.hist, THROW_BUTTONS, false, 12, f.lastConsumed) >= 0) {
-        techThrow(m, o, f);
-      }
+    case 'thrown':
+      if (f.stateFrame <= THROW_TECH_WINDOW && findPress(f.hist, L | G, false, 12, f.lastConsumed) >= 0) techThrow(m, o, f);
       return;
-    }
-    case 'prejump': {
-      const c = findCommand(f, 'prejump');
+    case 'air':
+    case 'airdash': {
+      if (f.state === 'air' && !f.airDashed && pressed(f, D) >= 0) {
+        setState(f, 'airdash');
+        f.airDashed = true;
+        f.lastConsumed = m.frame;
+        emitAt(m, 'dash', f);
+        return;
+      }
+      if (f.state === 'airdash' && f.stateFrame < 5) return;
+      if (f.airUsed) return;
+      const c = findCommand(f, 'air');
       if (c) startMove(m, f, o, c.move, c);
       return;
     }
-    case 'air': {
-      if (f.airUsed) return;
-      const b = newestButton(f);
-      const id = b && normalFor(f, b, 'air');
-      if (id) startMove(m, f, o, id);
+    case 'dash':
+      if (f.stateFrame >= 4) groundAttack(m, f, o);
       return;
-    }
+    case 'dashEnd':
+      groundAttack(m, f, o);
+      return;
     case 'move':
       moveControl(m, f, o);
       return;
   }
   if (!actionable(f)) return;
-  const c = findCommand(f, 'ground');
-  if (c) {
-    startMove(m, f, o, c.move, c);
+  if (groundAttack(m, f, o)) return;
+  const di = pressed(f, D);
+  if (di >= 0) {
+    startDash(m, f, di);
     return;
   }
-  const b = newestButton(f);
-  if (b) {
-    const id = normalFor(f, b, isDown(cur.dir) ? 'crouch' : 'stand');
-    if (id) {
-      startMove(m, f, o, id);
-      return;
-    }
-  }
-  const d = cur.dir;
-  if (isUp(d)) {
+  if (pressed(f, J) >= 0) {
     setState(f, 'prejump');
-    f.jumpDir = d === 7 ? -1 : d === 9 ? 1 : 0;
-    f.crouching = false;
+    f.vx = scale(JUMP_SPEED, cur.mx);
+    f.vz = scale(JUMP_SPEED, cur.mz);
+    f.lastConsumed = m.frame;
     return;
   }
-  const next = isDown(d) ? 'crouch' : isForward(d) ? 'walkF' : isBack(d) ? 'walkB' : 'idle';
-  f.crouching = next === 'crouch';
+  if (cur.held & G) {
+    if (f.state !== 'guard') setState(f, 'guard');
+    return;
+  }
+  const next = cur.mx || cur.mz ? 'run' : 'idle';
   if (f.state !== next) setState(f, next);
-  void st;
 }
 
 function moveControl(m: MatchState, f: FighterState, o: FighterState) {
@@ -450,19 +627,13 @@ function moveControl(m: MatchState, f: FighterState, o: FighterState) {
   const st = styleOf(f);
   // Drive Rush: cancel into any normal or throw from frame 9
   if (mv.tag === 'driveRush' && f.moveFrame >= 9) {
-    const c = findCommand(f, 'driveRush', { kinds: ['normal', 'throw'] });
+    const c = findCommand(f, 'driveRush', { kinds: ['normal', 'throw'], buffer: 8 });
     if (c) {
       startMove(m, f, o, c.move, c);
       return;
     }
-    const b = newestButton(f, 8);
-    const id = b && normalFor(f, b, isDown(f.hist[f.hist.length - 1].dir) ? 'crouch' : 'stand');
-    if (id) {
-      startMove(m, f, o, id);
-      return;
-    }
   }
-  // two-button commands win over a normal pressed a frame early (throws, parry, Drive Impact, Heat)
+  // two-button commands win over a normal pressed a frame early (throws, parry, Drive Impact, supers, tags)
   if (mv.kind === 'normal' && f.moveFrame <= 2 && !f.contact) {
     const c = findCommand(f, 'kara', { buffer: 3 });
     if (c) {
@@ -472,32 +643,28 @@ function moveControl(m: MatchState, f: FighterState, o: FighterState) {
   }
   const endActive = mv.startup + mv.active - 1;
   const connected = f.contact === 'hit' || f.contact === 'block';
-  // chains: strings (on whiff, at their natural timing) and target combos (on contact, at once)
+  // strings: at once on contact, otherwise when the active frames are over
   if (mv.chains && f.moveFrame >= mv.startup && f.moveFrame <= endActive + (mv.chainWindow ?? 8)) {
     for (const ch of mv.chains) {
-      if (!ch.onWhiff && !connected) continue;
-      if (ch.onWhiff && f.moveFrame < endActive && !connected) continue;
+      if (!connected && f.moveFrame < endActive) continue;
       const idx = findPress(f.hist, ch.buttons, true, m.frame - f.moveStartF + 1, f.moveStartF);
       if (idx < 0) continue;
-      if (ch.dirs && !ch.dirs.includes(f.hist[idx].dir)) continue;
+      if (ch.rel && !ch.rel.includes(f.hist[idx].rel)) continue;
       startMove(m, f, o, ch.to);
       return;
     }
   }
-  // special and super cancels, on hit or block
+  // cancels on hit or block
   if (mv.cancels && connected && f.moveFrame <= endActive + 10) {
     const buffer = m.frame - f.contactF + 10;
-    const kinds: string[] = [];
-    if (mv.cancels.includes('special')) kinds.push('special');
-    if (mv.cancels.includes('super')) kinds.push('super');
-    const c = kinds.length ? findCommand(f, 'cancel', { kinds, buffer }) : null;
+    const c = findCommand(f, 'cancel', { kinds: mv.cancels, buffer });
     if (c) {
       startMove(m, f, o, c.move, c);
       return;
     }
-    // Drive Rush cancel: MP+MK from a cancelable normal, 3 bars
-    if (st.drive && mv.cancels.includes('drive') && !f.burnout && f.drive > 0 && findPress(f.hist, MP | MK, false, buffer, f.lastConsumed) >= 0) {
-      startMove(m, f, o, 'drive_rush', { move: 'drive_rush', buttons: MP | MK, cost: { drive: 3 * DRIVE_BAR } });
+    // Drive Rush cancel: dash from a cancelable normal, 3 bars
+    if (st.drive && mv.cancels.includes('drive') && !f.burnout && f.drive > 0 && pressed(f, D, buffer) >= 0) {
+      startMove(m, f, o, 'drive_rush', { move: 'drive_rush', buttons: D, cost: { drive: 3 * DRIVE_BAR } });
     }
   }
 }
@@ -505,62 +672,87 @@ function moveControl(m: MatchState, f: FighterState, o: FighterState) {
 // ---------------------------------------------------------------------------------------------- per-frame motion
 
 function advance(m: MatchState, f: FighterState, o: FighterState) {
-  const st = styleOf(f);
   f.stateFrame++;
   if (f.throwProtect > 0) f.throwProtect--;
   // knockback slides the fighter in any state
   if (f.kb > 0) {
     const s = f.kb < 60 ? f.kb : Math.max(1, f.kb >> 2);
-    f.x += f.kbDir * s;
+    f.x += scale(s, f.kbx);
+    f.z += scale(s, f.kbz);
     f.kb -= s;
   }
+  const cur = f.hist[f.hist.length - 1];
   switch (f.state) {
     case 'idle':
-    case 'crouch':
+    case 'guard':
+    case 'win':
       break;
-    case 'walkF':
-      f.x += f.facing * st.walkF;
+    case 'run': {
+      const speed = kitOf(f).runSpeed;
+      f.x += scale(speed, cur.mx);
+      f.z += scale(speed, cur.mz);
       break;
-    case 'walkB':
-      f.x -= f.facing * st.walkB;
-      break;
+    }
     case 'prejump':
       if (f.stateFrame >= PREJUMP) {
         setState(f, 'air');
         f.vy = JUMP_VY;
-        f.vx = f.jumpDir * st.jumpVx * f.facing;
         f.y = 1;
         f.airUsed = false;
-        emit(m, 'jump', f);
+        f.airDashed = false;
+        emitAt(m, 'jump', f);
       }
       break;
     case 'air':
-      if (airPhysics(f)) {
-        setState(f, 'land');
-        f.stun = LANDING;
-        emit(m, 'land', f);
+      if (airPhysics(f)) land(m, f, LANDING);
+      break;
+    case 'airdash': {
+      const [ux, uz] = toward(f, o);
+      turnToward(f, ux, uz, 10);
+      f.x += scale(AIRDASH_SPEED, f.fx);
+      f.z += scale(AIRDASH_SPEED, f.fz);
+      if (f.stateFrame >= AIRDASH_FRAMES) {
+        setState(f, 'air');
+        f.vx = scale(400, f.fx);
+        f.vz = scale(400, f.fz);
+        f.vy = 0;
       }
       break;
+    }
     case 'land':
     case 'parryEnd':
+    case 'dashEnd':
       if (--f.stun <= 0) endMove(f);
       break;
     case 'dash': {
-      const t = f.stateFrame;
-      const speed = t <= 4 ? DASH_SPEED >> 1 : t <= 13 ? DASH_SPEED : DASH_SPEED >> 2;
-      f.x += f.facing * speed;
-      if (t >= DASH_FRAMES) endMove(f);
+      const [ux, uz] = toward(f, o);
+      turnToward(f, ux, uz, 15);
+      f.x += scale(DASH_SPEED, f.fx);
+      f.z += scale(DASH_SPEED, f.fz);
+      if (len(o.x - f.x, o.z - f.z) <= DASH_STOP || f.stateFrame >= DASH_MAX) {
+        setState(f, 'dashEnd');
+        f.stun = DASH_RECOVERY;
+      }
       break;
     }
     case 'backdash': {
-      const t = f.stateFrame;
-      const speed = t <= 14 ? BACKDASH_SPEED : BACKDASH_SPEED >> 2;
-      f.x -= f.facing * speed;
-      if (t >= BACKDASH_FRAMES) endMove(f);
+      const speed = f.stateFrame <= 14 ? BACKDASH_SPEED : BACKDASH_SPEED >> 2;
+      f.x -= scale(speed, f.fx);
+      f.z -= scale(speed, f.fz);
+      if (f.stateFrame >= BACKDASH_FRAMES) endMove(f);
+      break;
+    }
+    case 'sidedash': {
+      // circle: move across the line to the opponent
+      const [ux, uz] = toward(f, o);
+      const speed = f.stateFrame <= 14 ? SIDEDASH_SPEED : SIDEDASH_SPEED >> 2;
+      f.x += scale(speed, -uz * f.dashSide);
+      f.z += scale(speed, ux * f.dashSide);
+      if (f.stateFrame >= SIDEDASH_FRAMES) endMove(f);
       break;
     }
     case 'move':
-      advanceMove(m, f);
+      advanceMove(m, f, o);
       break;
     case 'hitstun':
     case 'blockstun':
@@ -568,7 +760,6 @@ function advance(m: MatchState, f: FighterState, o: FighterState) {
       if (--f.stun <= 0) {
         endMove(f);
         f.throwProtect = THROW_PROTECT;
-        f.blockHeight = '';
       }
       break;
     case 'juggle':
@@ -576,9 +767,10 @@ function advance(m: MatchState, f: FighterState, o: FighterState) {
         if (f.health <= 0) setState(f, 'ko');
         else {
           setState(f, 'knockdown');
-          emit(m, 'knockdown', f);
+          emitAt(m, 'knockdown', f);
         }
         f.vx = 0;
+        f.vz = 0;
         f.pendingWallSplat = false;
       }
       break;
@@ -599,14 +791,15 @@ function advance(m: MatchState, f: FighterState, o: FighterState) {
       if (--f.stun <= 0) {
         setState(f, 'juggle');
         f.vy = 200;
-        f.vx = -f.facing * 150;
+        f.vx = scale(150, f.fx);
+        f.vz = scale(150, f.fz);
         f.juggleCount = 99;
       }
       break;
     case 'crumple':
       if (f.stateFrame >= CRUMPLE_FRAMES) {
         setState(f, 'knockdown');
-        emit(m, 'knockdown', f);
+        emitAt(m, 'knockdown', f);
       }
       break;
     case 'dizzy':
@@ -621,19 +814,27 @@ function advance(m: MatchState, f: FighterState, o: FighterState) {
       }
       break;
     case 'thrown':
-      f.x = o.x + o.facing * 4600;
+      f.x = o.x + scale(4600, o.fx);
+      f.z = o.z + scale(4600, o.fz);
       break;
     case 'throwing':
       advanceThrow(m, f, o);
       break;
-    case 'win':
-      break;
   }
+}
+
+function land(m: MatchState, f: FighterState, recovery: number) {
+  setState(f, 'land');
+  f.stun = recovery;
+  f.vx = 0;
+  f.vz = 0;
+  emitAt(m, 'land', f);
 }
 
 // returns true on landing
 function airPhysics(f: FighterState): boolean {
   f.x += f.vx;
+  f.z += f.vz;
   f.y += f.vy;
   f.vy -= f.state === 'juggle' ? JUGGLE_GRAVITY : GRAVITY;
   if (f.y <= 0 && f.vy < 0) {
@@ -644,65 +845,138 @@ function airPhysics(f: FighterState): boolean {
   return false;
 }
 
-function advanceMove(m: MatchState, f: FighterState) {
+function advanceMove(m: MatchState, f: FighterState, o: FighterState) {
   const mv = moveOf(f);
   f.moveFrame++;
   const t = f.moveFrame;
-  if (mv.velocity) {
-    for (const seg of mv.velocity) {
-      if (t < seg.from || t > seg.to) continue;
-      f.x += f.facing * seg.vx;
-      if (seg.vy !== undefined && t === seg.from) {
-        f.vy = seg.vy;
-        f.y = Math.max(f.y, 1);
-      }
+  if (mv.homing && t <= mv.homing) {
+    const [ux, uz] = toward(f, o);
+    turnToward(f, ux, uz, 10);
+  }
+  for (const seg of mv.velocity ?? []) {
+    if (t < seg.from || t > seg.to) continue;
+    f.x += scale(seg.fwd, f.fx);
+    f.z += scale(seg.fwd, f.fz);
+    if (seg.vy !== undefined && t === seg.from) {
+      f.vy = seg.vy;
+      f.y = Math.max(f.y, 1);
     }
   }
-  if (f.fromDriveRush && t <= 8) f.x += f.facing * 260;
-  if (mv.projectile && t === mv.startup) spawnProjectile(m, f, mv);
+  if ((f.fromDriveRush || f.fromDash) && t <= 8) {
+    const boost = f.fromDriveRush ? 260 : DASH_MOMENTUM;
+    f.x += scale(boost, f.fx);
+    f.z += scale(boost, f.fz);
+  }
+  if (mv.teleport && t === mv.teleport) teleportBehind(m, f, o);
+  if (mv.projectile && t === mv.startup) spawnProjectile(m, f.side, f.char, mv, f, o);
+  if (mv.beam && t === mv.startup) spawnBeam(m, f.side, f.char, mv, f, o, false);
   if (airborne(f)) {
     const wasRising = f.vy > 0;
-    // ground moves with their own lift (uppercuts, hop kicks) don't keep jump momentum
-    if (!mv.air) f.vx = 0;
-    if (airPhysics(f)) {
-      if (mv.air || t >= mv.startup || !wasRising) {
-        setState(f, 'land');
-        f.stun = mv.air ? (mv.landingRecovery ?? LANDING) : (mv.landingRecovery ?? LANDING);
-        f.moveId = '';
-        emit(m, 'land', f);
-        return;
-      }
+    // ground moves with their own lift (uppercuts, flips) don't keep jump momentum
+    if (!mv.air) {
+      f.vx = 0;
+      f.vz = 0;
+    }
+    if (airPhysics(f) && (mv.air || t >= mv.startup || !wasRising)) {
+      land(m, f, mv.landingRecovery ?? LANDING);
+      return;
     }
   }
   // the move's last frame: the fighter can act on the next one
   if (t >= totalFrames(mv)) {
     if (airborne(f)) {
-      if (mv.air) {
-        setState(f, 'air');
-        f.moveId = '';
-      }
-      // ground moves that are still in the air keep falling inside the move until they land
+      // air moves finish in a normal fall; ground moves still in the air keep falling inside the move
+      if (mv.air) setState(f, 'air');
       return;
     }
     endMove(f);
   }
 }
 
-function spawnProjectile(m: MatchState, f: FighterState, mv: MoveDef) {
-  const p = mv.projectile!;
-  const proj: ProjectileState = {
-    owner: f.side,
+function teleportBehind(m: MatchState, f: FighterState, o: FighterState) {
+  const [ux, uz] = norm(f.x - o.x, f.z - o.z, -o.fx, -o.fz);
+  f.x = o.x - scale(14000, ux);
+  f.z = o.z - scale(14000, uz);
+  clampArena(f);
+  face(f, o);
+  emitAt(m, 'teleport', f);
+}
+
+function spawnProjectile(m: MatchState, side: 0 | 1, kit: 0 | 1, mv: MoveDef, from: Actor, target: FighterState) {
+  const pd = mv.projectile!;
+  const [dx, dz] = norm(target.x - from.x, target.z - from.z, from.fx, from.fz);
+  const p: ProjectileState = {
+    owner: side,
+    kit,
     moveId: mv.id,
-    x: f.x + f.facing * p.spawnX,
-    y: f.y + p.spawnY,
-    vx: f.facing * p.speed,
-    life: p.life,
+    x: from.x + scale(pd.spawnF, dx),
+    z: from.z + scale(pd.spawnF, dz),
+    y: from.y + pd.spawnY,
+    dx,
+    dz,
+    vy: pd.dropVy ?? 0,
+    speed: pd.speed,
+    life: pd.life,
     age: 0,
-    kind: p.kind,
+    kind: pd.kind,
     dodged: false,
   };
-  m.projectiles.push(proj);
-  emit(m, 'projectile', f, 1, undefined, proj.x, proj.y);
+  m.projectiles.push(p);
+  emit(m, 'projectile', side, p.x, p.y, p.z);
+}
+
+function spawnBeam(m: MatchState, side: 0 | 1, kit: 0 | 1, mv: MoveDef, from: Actor, target: FighterState, fromAssist: boolean) {
+  const bd = mv.beam!;
+  const [dx, dz] = norm(target.x - from.x, target.z - from.z, from.fx, from.fz);
+  const b: BeamState = {
+    owner: side,
+    kit,
+    moveId: mv.id,
+    fromAssist,
+    x: from.x + scale(3000, dx),
+    z: from.z + scale(3000, dz),
+    y: from.y + bd.spawnY,
+    dx,
+    dz,
+    len: 0,
+    age: 0,
+    clashing: false,
+  };
+  m.beams.push(b);
+  emit(m, 'beam', side, b.x, b.y, b.z);
+}
+
+const beamMove = (m: MatchState, b: { owner: 0 | 1; kit: 0 | 1; moveId: string }) => STYLES[m.fighters[b.owner].style].kits[b.kit].moves[b.moveId];
+const projMove = beamMove;
+
+function stepProjectiles(m: MatchState) {
+  for (const p of m.projectiles) {
+    const pd = projMove(m, p).projectile!;
+    if (pd.homing) {
+      const t = m.fighters[1 - p.owner];
+      const [tx, tz] = norm(t.x - p.x, t.z - p.z, p.dx, p.dz);
+      const f = { fx: p.dx, fz: p.dz };
+      turnToward(f, tx, tz, pd.homing as 3);
+      p.dx = f.fx;
+      p.dz = f.fz;
+    }
+    p.x += scale(p.speed, p.dx);
+    p.z += scale(p.speed, p.dz);
+    p.y += p.vy;
+    p.age++;
+    p.life--;
+    if (len(p.x, p.z) > ARENA_R + 4000 || p.y < 0) p.life = 0;
+  }
+}
+
+function stepBeams(m: MatchState) {
+  for (const b of m.beams) {
+    if (b.clashing) continue;
+    const bd = beamMove(m, b).beam!;
+    b.len = Math.min(bd.length, b.len + bd.grow);
+    b.age++;
+  }
+  m.beams = m.beams.filter((b) => b.clashing || b.age < beamMove(m, b).beam!.duration);
 }
 
 // ---------------------------------------------------------------------------------------------- throws
@@ -724,10 +998,11 @@ function throwable(f: FighterState) {
       return false;
     case 'backdash':
       return f.stateFrame > 10;
+    case 'sidedash':
+      return f.stateFrame > SIDEDASH_INVULN[1];
     case 'move': {
       const mv = moveOf(f);
-      if (mv.invuln && f.moveFrame >= mv.invuln[0] && f.moveFrame <= mv.invuln[1]) return false;
-      return true;
+      return !(mv.invuln && f.moveFrame >= mv.invuln[0] && f.moveFrame <= mv.invuln[1]);
     }
   }
   return true;
@@ -735,10 +1010,7 @@ function throwable(f: FighterState) {
 
 function tryThrow(m: MatchState, f: FighterState, o: FighterState, mv: MoveDef): boolean {
   if (!throwable(o)) return false;
-  const reach = toWorld(f, mv.hitbox!);
-  const half = pushHalf(o);
-  const body: Box = { x: o.x - half, y: 0, w: half * 2, h: STAND_HEIGHT };
-  if (!overlap(reach, body)) return false;
+  if (!hitTest(f, mv.hitbox!, { x: o.x, z: o.z, r: BODY_R, y0: 0, y1: STAND_HEIGHT })) return false;
   // both throwing at once: a tech
   if (o.state === 'move' && moveOf(o).kind === 'throw' && o.moveFrame >= moveOf(o).startup) {
     techThrow(m, f, o);
@@ -748,202 +1020,192 @@ function tryThrow(m: MatchState, f: FighterState, o: FighterState, mv: MoveDef):
   setState(f, 'throwing');
   setState(o, 'thrown');
   o.lastConsumed = Math.max(o.lastConsumed, m.frame - 4);
-  o.crouching = false;
   o.kb = 0;
   f.kb = 0;
   f.throwTimer = counter ? 1 : 0;
   f.contact = 'hit';
   f.contactF = m.frame;
-  emit(m, 'throw', f, 1, counter ? 'PUNISH COUNTER' : undefined);
+  emitAt(m, 'throw', f, 1, counter ? 'PUNISH COUNTER' : undefined);
   return true;
 }
 
 function techThrow(m: MatchState, a: FighterState, b: FighterState) {
-  for (const [f, o] of [[a, b], [b, a]] as const) {
+  for (const [f, o] of [
+    [a, b],
+    [b, a],
+  ] as const) {
     setState(f, 'blockstun');
     f.stun = 18;
     f.kb = 5200;
-    f.kbDir = (f.x >= o.x ? 1 : -1) as Facing;
-    f.moveId = '';
+    [f.kbx, f.kbz] = norm(f.x - o.x, f.z - o.z, -f.fx, -f.fz);
     f.contact = 'block';
   }
-  emit(m, 'tech', a, 1, 'TECH', (a.x + b.x) >> 1);
+  emit(m, 'tech', a.side, (a.x + b.x) >> 1, 12000, (a.z + b.z) >> 1, 1, 'TECH');
   m.freeze = 8;
 }
 
 function advanceThrow(m: MatchState, f: FighterState, o: FighterState) {
   const t = f.stateFrame;
   if (t === THROW_TECH_WINDOW + 1 && o.state === 'thrown') {
-    const mv = styleOf(f).moves.throw;
-    const mult = f.throwTimer ? 1.7 : 1;
-    const dmg = Math.floor((mv.throwDamage ?? 1200) * mult);
+    const mv = kitOf(f).moves.throw;
+    const dmg = Math.floor((mv.throwDamage ?? 1200) * (f.throwTimer ? 1.7 : 1));
     o.health = Math.max(0, o.health - dmg);
     o.comboHits = 1;
     o.comboDamage = dmg;
     if (f.throwBack) {
-      // back throw: the victim lands on the other side
-      o.x = f.x - f.facing * 4600;
+      // back throw: the victim lands behind the thrower
+      o.x = f.x - scale(4600, f.fx);
+      o.z = f.z - scale(4600, f.fz);
+      clampArena(o);
     }
-    const dir: Facing = o.x >= f.x ? 1 : -1;
+    const [dx, dz] = norm(o.x - f.x, o.z - f.z, f.fx, f.fz);
     setState(o, o.health <= 0 ? 'ko' : 'juggle');
     o.vy = 900;
-    o.vx = dir * 420;
+    o.vx = scale(420, dx);
+    o.vz = scale(420, dz);
     o.y = 1;
     o.juggleCount = 99;
     m.bestCombo[f.side] = Math.max(m.bestCombo[f.side], dmg);
     m.freeze = 10;
-    emit(m, 'hit', o, 3, undefined, o.x, 10000);
-    if (o.health <= 0) emit(m, 'ko', o);
+    emit(m, 'hit', o.side, o.x, 10000, o.z, 3);
+    if (o.health <= 0) emitAt(m, 'ko', o);
   }
   if (t >= 32) endMove(f);
 }
 
 // ---------------------------------------------------------------------------------------------- hits
 
-function invulnerableTo(def: FighterState, mv: MoveDef, projectile: boolean): boolean {
+type HitKind = 'strike' | 'assist' | 'projectile' | 'beam';
+
+interface Source {
+  owner: FighterState;
+  actor: Actor;
+  mv: MoveDef;
+  kind: HitKind;
+  // knockback direction
+  dx: number;
+  dz: number;
+  // the attacker's current move frame, for exact advantage on strikes
+  moveFrame: number;
+  isLast: boolean;
+  force?: boolean;
+}
+
+function invulnerableTo(def: FighterState, mv: MoveDef, kind: HitKind): boolean {
+  if (def.state === 'sidedash' && def.stateFrame >= SIDEDASH_INVULN[0] && def.stateFrame <= SIDEDASH_INVULN[1]) {
+    return kind === 'projectile' || kind === 'beam' || !mv.tracking;
+  }
+  if (def.state === 'backdash' && def.stateFrame >= BACKDASH_INVULN[0] && def.stateFrame <= BACKDASH_INVULN[1]) {
+    return kind === 'strike' || kind === 'assist';
+  }
   if (def.state === 'move') {
     const dm = moveOf(def);
-    if (dm.invuln && def.moveFrame >= dm.invuln[0] && def.moveFrame <= dm.invuln[1]) {
-      if (dm.tag === 'evade') return projectile || !mv.tracking;
-      return true;
-    }
+    if (dm.invuln && def.moveFrame >= dm.invuln[0] && def.moveFrame <= dm.invuln[1]) return true;
   }
   return false;
 }
 
-function canBlock(def: FighterState, att: FighterState, mv: MoveDef): 'stand' | 'crouch' | '' {
-  if (airborne(def)) return '';
-  if (!(actionable(def) || def.state === 'blockstun')) return '';
-  const st = styleOf(def);
-  const raw = def.hist[def.hist.length - 1].raw;
-  // "back" is away from the attacker, so cross-ups are blocked by holding the other way
-  const away = att.x >= def.x ? IN.LEFT : IN.RIGHT;
-  const toward = away === IN.LEFT ? IN.RIGHT : IN.LEFT;
-  const holdAway = (raw & away) !== 0 && (raw & toward) === 0;
-  const down = (raw & IN.DOWN) !== 0 && (raw & IN.UP) === 0;
-  const holdToward = (raw & toward) !== 0 && (raw & away) === 0;
-  const crouchGuard = down && (holdAway || (st.crouchGuardDirs.includes(2) && !holdToward));
-  const neutral = !holdAway && !holdToward && !down && (raw & IN.UP) === 0;
-  const standGuard = !down && (holdAway || (st.neutralGuard && neutral && (def.state === 'idle' || def.state === 'blockstun')));
-  switch (mv.height) {
-    case 'high':
-      return standGuard ? 'stand' : crouchGuard ? 'crouch' : '';
-    case 'mid':
-      // a crouching guard stops a mid only when both styles allow it: Iron mids must be blocked standing,
-      // and an Iron fighter can't crouch-block anyone's mids
-      return standGuard ? 'stand' : crouchGuard && st.crouchGuardBlocksMid && styleOf(att).crouchGuardBlocksMid ? 'crouch' : '';
-    case 'low':
-      return crouchGuard ? 'crouch' : '';
-    case 'overhead':
-      return standGuard ? 'stand' : '';
-  }
+function canGuard(def: FighterState, fromX: number, fromZ: number): boolean {
+  if (airborne(def)) return false;
+  if (!(def.state === 'guard' || def.state === 'blockstun' || def.state === 'idle' || def.state === 'run')) return false;
+  if (!(def.hist[def.hist.length - 1].held & G)) return false;
+  const [tx, tz] = norm(fromX - def.x, fromZ - def.z, def.fx, def.fz);
+  return dotU(def.fx, def.fz, tx, tz) >= GUARD_ARC;
 }
 
 const defaultPush = (dmg: number) => (dmg <= 300 ? 2200 : dmg <= 700 ? 3000 : 3800);
 const defaultHitstop = (dmg: number) => (dmg <= 300 ? 8 : dmg <= 700 ? 10 : 12);
 
-function pushApart(att: FighterState, def: FighterState, amount: number) {
-  const dir: Facing = def.x >= att.x ? 1 : -1;
-  const wallX = dir === 1 ? WALL : -WALL;
-  const room = Math.abs(wallX - def.x);
-  if (room < amount) {
+// knock `def` back along (dx, dz); if the fence is in the way, the attacker is pushed back instead
+function pushApart(att: FighterState | null, def: FighterState, amount: number, dx: number, dz: number) {
+  const room = roomToWall(def, dx, dz);
+  def.kbx = dx;
+  def.kbz = dz;
+  if (room < amount && att) {
     def.kb = room;
-    def.kbDir = dir;
     att.kb = amount - room;
-    att.kbDir = (-dir) as Facing;
-  } else {
-    def.kb = amount;
-    def.kbDir = dir;
-  }
-}
-
-interface Source {
-  att: FighterState;
-  mv: MoveDef;
-  projectile?: ProjectileState;
+    att.kbx = -dx;
+    att.kbz = -dz;
+  } else def.kb = amount;
 }
 
 function applyHit(m: MatchState, src: Source, def: FighterState) {
-  const { att, mv } = src;
-  const isProj = !!src.projectile;
-  const hits = mv.hits ?? 1;
-  if (!isProj) att.hitConnected++;
-  const isLast = isProj || att.hitConnected >= hits;
-  const hitstop = mv.hitstop ?? defaultHitstop(mv.damage);
-  const fx = isProj ? src.projectile!.x : def.x - att.facing * 1200;
-  const fy = isProj ? src.projectile!.y : Math.min(def.y + 13000, Math.max(def.y + 3000, att.y + (mv.hitbox ? mv.hitbox.y + (mv.hitbox.h >> 1) : 12000)));
+  const { owner: att, actor, mv, kind } = src;
+  const strike = kind === 'strike';
+  // beam ticks only pause the fight briefly, or a long beam would freeze it
+  const hitstop = kind === 'beam' && !src.force ? Math.min(mv.hitstop ?? 3, 3) : (mv.hitstop ?? defaultHitstop(mv.damage));
+  const [tx, tz] = norm(actor.x - def.x, actor.z - def.z, def.fx, def.fz);
+  const fx = def.x + scale(1500, tx);
+  const fz = def.z + scale(1500, tz);
+  const fy = kind === 'projectile' || kind === 'beam' ? actor.y : Math.min(def.y + 14000, Math.max(def.y + 4000, actor.y + (mv.hitbox ? (mv.hitbox.y0 + mv.hitbox.y1) >> 1 : 12000)));
+  const fighterAtt = strike ? att : null;
   const markContact = (c: 'hit' | 'block') => {
-    if (isProj) return;
+    if (!strike) return;
     att.contact = c;
     att.contactF = m.frame;
     m.advPending[att.side] = 1;
   };
 
   // Drive Parry
-  if (def.state === 'parry') {
-    const perfect = def.stateFrame <= 2 && !isProj;
+  if (!src.force && def.state === 'parry') {
+    const perfect = def.stateFrame <= 2 && strike;
     def.drive = Math.min(DRIVE_MAX, def.drive + (perfect ? 2 * DRIVE_BAR : DRIVE_BAR >> 1));
     markContact('block');
-    if (!isProj) pushApart(def, att, 1600);
+    if (strike) pushApart(def, att, 1600, -tx, -tz);
     if (perfect) {
       setState(att, 'stagger');
       att.stun = 28;
       att.comboScale50 = true;
-      att.moveId = '';
       m.freeze = 22;
-      emit(m, 'perfectParry', def, 2, 'PERFECT PARRY', fx, fy);
+      emit(m, 'perfectParry', def.side, fx, fy, fz, 2, 'PERFECT PARRY');
     } else {
       m.freeze = 8;
-      emit(m, 'parry', def, 1, undefined, fx, fy);
+      emit(m, 'parry', def.side, fx, fy, fz);
     }
     def.stateFrame = Math.min(def.stateFrame, 3);
     return;
   }
 
   // armor absorbs hits during the move's startup
-  if (def.state === 'move' && def.armorLeft > 0 && def.moveFrame < moveOf(def).startup + moveOf(def).active) {
+  if (!src.force && def.state === 'move' && def.armorLeft > 0 && def.moveFrame < moveOf(def).startup + moveOf(def).active) {
     def.armorLeft--;
     def.health = Math.max(1, def.health - (mv.damage >> 1));
     markContact('block');
     m.freeze = hitstop;
-    emit(m, 'armor', def, 1, 'ARMOR', fx, fy);
+    emit(m, 'armor', def.side, fx, fy, fz, 1, 'ARMOR');
     return;
   }
 
-  const guard = canBlock(def, att, mv);
-  if (guard) {
+  if (!src.force && canGuard(def, actor.x, actor.z)) {
     markContact('block');
     let chip = mv.chip ?? 0;
     if (def.burnout) chip += mv.damage >> 2;
-    if (att.heatTimer > 0) chip += Math.floor(mv.damage * 0.15);
     def.health = Math.max(mv.kind === 'normal' ? 1 : 0, def.health - chip);
     if (styleOf(def).drive) {
       def.drive -= Math.floor(mv.damage * 2.5);
       if (def.drive <= 0) enterBurnout(m, def);
     }
     let stun: number;
-    if (isProj) stun = mv.projectile!.blockstun;
+    if (kind === 'projectile') stun = mv.projectile!.blockstun;
+    else if (kind === 'beam') stun = mv.beam!.blockstun;
+    else if (kind === 'assist') stun = 16;
     else if (mv.airStun) stun = mv.airStun.block + (att.fromDriveRush ? DRIVE_RUSH_BONUS : 0);
-    else if (!isLast) stun = (mv.hitInterval ?? 4) + 6;
-    else stun = Math.max(1, mv.onBlock + (att.fromDriveRush ? DRIVE_RUSH_BONUS : 0) + totalFrames(mv) - att.moveFrame);
+    else if (!src.isLast) stun = (mv.hitInterval ?? 4) + 6;
+    else stun = Math.max(1, mv.onBlock + (att.fromDriveRush ? DRIVE_RUSH_BONUS : 0) + totalFrames(mv) - src.moveFrame);
     setState(def, 'blockstun');
     def.stun = stun;
-    def.blockHeight = guard;
-    def.crouching = guard === 'crouch';
-    pushApart(att, def, Math.floor((mv.pushback ?? defaultPush(mv.damage)) * 1.1));
+    pushApart(fighterAtt, def, Math.floor((mv.pushback ?? defaultPush(mv.damage)) * 1.1), src.dx, src.dz);
     gainMeter(att, mv.damage >> 1, def, mv.damage >> 2);
     m.freeze = hitstop;
-    emit(m, 'block', def, mv.damage >= 800 ? 2 : 1, undefined, fx, fy);
+    emit(m, 'block', def.side, fx, fy, fz, mv.damage >= 800 ? 2 : 1);
     if (mv.tag === 'driveImpact') {
       if (def.burnout) {
         setState(def, 'dizzy');
         def.kb = 0;
-        emit(m, 'dizzy', def, 2, 'STUN');
-      } else if (atWall(def, att.facing)) {
-        wallSplat(m, def, att);
-      }
+        emitAt(m, 'dizzy', def, 2, 'STUN');
+      } else if (atWall(def)) wallSplat(m, def, actor);
     }
-    if (def.health <= 0) koHit(m, att, def);
+    if (def.health <= 0) koHit(m, def, src.dx, src.dz);
     return;
   }
 
@@ -954,7 +1216,6 @@ function applyHit(m: MatchState, src: Source, def: FighterState) {
     def.comboHits = 0;
     def.comboDamage = 0;
     def.juggleCount = 0;
-    def.tornadoUsed = false;
     def.wallSplats = 0;
     if (def.state !== 'stagger') def.comboScale50 = false;
   }
@@ -966,9 +1227,7 @@ function applyHit(m: MatchState, src: Source, def: FighterState) {
   let pct = SCALING[Math.min(def.comboHits, SCALING.length - 1)];
   if (def.comboScale50) pct = pct >> 1;
   pct = Math.max(pct, mv.minScale ?? 10);
-  let mult = 100;
-  if (counter) mult += 20;
-  if (rageActive(att)) mult += 10;
+  const mult = counter ? 120 : 100;
   const dmg = Math.floor((mv.damage * pct * mult) / 10000);
   def.health = Math.max(0, def.health - dmg);
   def.comboHits++;
@@ -978,36 +1237,31 @@ function applyHit(m: MatchState, src: Source, def: FighterState) {
   gainMeter(att, dmg, def, dmg >> 2);
   if (styleOf(att).drive && !att.burnout) att.drive = Math.min(DRIVE_MAX, att.drive + (dmg >> 1));
   m.freeze = hitstop + (counter ? 2 : 0);
-  emit(m, 'hit', def, dmg >= 1500 ? 3 : dmg >= 700 ? 2 : 1, undefined, fx, fy);
-  if (counter === 'counter') emit(m, 'counter', att, 1, 'COUNTER');
-  if (counter === 'punish') emit(m, 'punish', att, 1, 'PUNISH COUNTER');
+  emit(m, 'hit', def.side, fx, fy, fz, dmg >= 1500 ? 3 : dmg >= 700 ? 2 : 1);
+  if (counter === 'counter') emitAt(m, 'counter', att, 1, 'COUNTER');
+  if (counter === 'punish') emitAt(m, 'punish', att, 1, 'PUNISH COUNTER');
   def.kb = 0;
-
   if (def.health <= 0) {
-    koHit(m, att, def);
+    koHit(m, def, src.dx, src.dz);
     return;
   }
 
   const wasAir = airborne(def) || def.state === 'juggle';
   if (mv.crumple && !wasAir) {
-    if (atWall(def, att.facing)) wallSplat(m, def, att);
+    if (atWall(def)) wallSplat(m, def, actor);
     else {
       setState(def, 'crumple');
-      emit(m, 'driveImpact', def, 2, 'CRUMPLE');
+      emitAt(m, 'driveImpact', def, 2, 'CRUMPLE');
     }
-    def.crouching = false;
     return;
   }
   if (def.state === 'crumple' || def.state === 'dizzy') {
-    // follow-ups on a crumpled or stunned fighter pop them up
-    if (def.state === 'crumple' || mv.launch) {
-      launch(def, att, mv.launch?.vx ?? 300, mv.launch?.vy ?? 1100, mv);
-      return;
-    }
+    launch(def, src, mv.launch?.fwd ?? 300, mv.launch?.vy ?? 1100, mv);
+    return;
   }
   if (def.state === 'wallsplat') {
     if (mv.launch || def.wallSplats >= 3) {
-      launch(def, att, -(mv.launch?.vx ?? 300), mv.launch?.vy ?? 900, mv);
+      launch(def, src, -(mv.launch?.fwd ?? 300), mv.launch?.vy ?? 900, mv);
       def.juggleCount = 99;
     } else {
       def.stun = Math.max(18, WALLSPLAT_FRAMES - def.comboHits * 3);
@@ -1016,74 +1270,72 @@ function applyHit(m: MatchState, src: Source, def: FighterState) {
     return;
   }
   if (wasAir) {
-    const decay = Math.max(35, 100 - 12 * def.juggleCount);
     // launchers relaunch; other hits only keep the fighter floating
-    let vy = Math.floor(((mv.launch?.vy ?? 480) * decay) / 100);
-    if (mv.tornado && !def.tornadoUsed) {
-      vy = 1450;
-      def.tornadoUsed = true;
-      emit(m, 'tornado', def, 2, 'TORNADO');
-    }
-    launch(def, att, mv.launch?.vx ?? 260, isProj ? 600 : vy, mv);
+    const decay = Math.max(35, 100 - 12 * def.juggleCount);
+    const vy = kind === 'projectile' || kind === 'beam' ? 500 : Math.floor(((mv.launch?.vy ?? 480) * decay) / 100);
+    launch(def, src, mv.launch?.fwd ?? 260, vy, mv);
     def.juggleCount++;
     if (mv.air) def.juggleCount = 99; // air-to-air hits reset, they don't juggle
     return;
   }
-  if (mv.launch && isLast) {
-    launch(def, att, mv.launch.vx, mv.launch.vy, mv);
+  if (mv.launch && src.isLast) {
+    launch(def, src, mv.launch.fwd, mv.launch.vy, mv);
     if (mv.knockdown && mv.launch.vy < 800) def.juggleCount = 99; // sweeps and soft knockdowns
     return;
   }
   let stun: number;
-  if (isProj) stun = mv.projectile!.hitstun;
+  if (kind === 'projectile') stun = mv.projectile!.hitstun;
+  else if (kind === 'beam') stun = mv.beam!.hitstun;
+  else if (kind === 'assist') stun = 24;
   else if (mv.airStun) stun = mv.airStun.hit + (att.fromDriveRush ? DRIVE_RUSH_BONUS : 0);
-  else if (!isLast) stun = (mv.hitInterval ?? 4) + 6;
+  else if (!src.isLast) stun = (mv.hitInterval ?? 4) + 6;
   else {
     let adv = mv.onHit + (att.fromDriveRush ? DRIVE_RUSH_BONUS : 0);
     if (counter === 'counter') adv += 2;
     if (counter === 'punish') adv += 4;
-    stun = Math.max(1, adv + totalFrames(mv) - att.moveFrame);
+    stun = Math.max(1, adv + totalFrames(mv) - src.moveFrame);
   }
-  def.lastStunKind = def.crouching ? 'crouch' : mv.height === 'low' ? 'low' : 'high';
+  def.lastStunKind = mv.hitbox && mv.hitbox.y1 <= 4000 ? 'low' : 'high';
   setState(def, 'hitstun');
   def.stun = stun;
   def.pendingWallSplat = !!mv.wallSplat && def.wallSplats < 2;
-  pushApart(att, def, mv.pushback ?? defaultPush(mv.damage));
+  pushApart(fighterAtt, def, mv.pushback ?? defaultPush(mv.damage), src.dx, src.dz);
 }
 
-function launch(def: FighterState, att: FighterState, vx: number, vy: number, mv: MoveDef) {
+function launch(def: FighterState, src: Source, fwd: number, vy: number, mv: MoveDef) {
   setState(def, 'juggle');
-  def.vx = att.facing * Math.floor(vx / 3);
+  const v = Math.trunc(fwd / 3);
+  def.vx = scale(v, src.dx);
+  def.vz = scale(v, src.dz);
   def.vy = vy;
   def.y = Math.max(def.y, 1);
   def.kb = 0;
-  def.crouching = false;
   def.pendingWallSplat = !!mv.wallSplat && def.wallSplats < 2;
 }
 
-function wallSplat(m: MatchState, def: FighterState, att: FighterState) {
+function wallSplat(m: MatchState, def: FighterState, from: { x: number; z: number }) {
   setState(def, 'wallsplat');
   def.stun = WALLSPLAT_FRAMES;
   def.wallSplats++;
   def.vx = 0;
+  def.vz = 0;
   def.vy = 0;
   def.y = Math.max(def.y, 3500);
   def.kb = 0;
-  def.facing = (att.x >= def.x ? 1 : -1) as Facing;
+  [def.fx, def.fz] = norm(from.x - def.x, from.z - def.z, def.fx, def.fz);
   def.pendingWallSplat = false;
-  def.crouching = false;
   m.freeze = Math.max(m.freeze, 14);
-  emit(m, 'wallSplat', def, 2, 'WALL SPLAT');
+  emitAt(m, 'wallSplat', def, 2, 'WALL SPLAT');
 }
 
-function koHit(m: MatchState, att: FighterState, def: FighterState) {
+function koHit(m: MatchState, def: FighterState, dx: number, dz: number) {
   setState(def, 'ko');
   def.vy = 1200;
-  def.vx = att.facing * 260;
+  def.vx = scale(260, dx);
+  def.vz = scale(260, dz);
   def.y = Math.max(def.y, 1);
-  def.crouching = false;
   m.freeze = 40;
-  emit(m, 'ko', def, 3, 'K.O.');
+  emitAt(m, 'ko', def, 3, 'K.O.');
 }
 
 function gainMeter(att: FighterState, attGain: number, def: FighterState, defGain: number) {
@@ -1091,135 +1343,288 @@ function gainMeter(att: FighterState, attGain: number, def: FighterState, defGai
   if (styleOf(def).supers) def.superMeter = Math.min(SUPER_MAX, def.superMeter + defGain);
 }
 
+// an assist that gets hit is knocked out of the fight, and the team takes the damage
+function hitAssist(m: MatchState, src: Source, a: AssistState) {
+  const owner = m.fighters[a.side];
+  const dmg = Math.floor(src.mv.damage * 1.2);
+  owner.health = Math.max(0, owner.health - dmg);
+  a.state = 'hit';
+  a.stateFrame = 0;
+  a.vx = scale(500, src.dx);
+  a.vz = scale(500, src.dz);
+  a.vy = 900;
+  a.y = Math.max(a.y, 1);
+  if (src.kind === 'strike') {
+    src.owner.contact = 'hit';
+    src.owner.contactF = m.frame;
+  }
+  m.freeze = Math.max(m.freeze, 12);
+  emit(m, 'hit', a.side, a.x, 12000, a.z, 2);
+  emit(m, 'assistHit', a.side, a.x, 14000, a.z, 1, 'ASSIST HIT');
+  if (owner.health <= 0) koHit(m, owner, src.dx, src.dz);
+}
+
 function resolveHits(m: MatchState) {
-  const [a, b] = m.fighters;
-  const strikes: Array<[FighterState, FighterState, MoveDef]> = [];
-  for (const [att, def] of [[a, b], [b, a]] as const) {
-    if (att.state !== 'move') continue;
-    const mv = moveOf(att);
-    if (!mv.hitbox) continue;
-    const k = att.moveFrame - mv.startup;
-    if (k < 0 || k >= mv.active) continue;
-    if (mv.kind === 'throw') {
-      if (att.hitConnected === 0 && tryThrow(m, att, def, mv)) att.hitConnected = 1;
-      continue;
+  const strikes: Array<{ src: Source; def?: FighterState; assist?: AssistState }> = [];
+  for (const s of [0, 1] as const) {
+    const att = m.fighters[s];
+    const def = m.fighters[1 - s];
+    const defAssist = m.assists[1 - s];
+    if (att.state === 'move') {
+      const mv = moveOf(att);
+      const k = att.moveFrame - mv.startup;
+      if (mv.hitbox && k >= 0 && k < mv.active) {
+        if (mv.kind === 'throw') {
+          if (att.hitConnected === 0 && tryThrow(m, att, def, mv)) att.hitConnected = 1;
+        } else {
+          const hits = mv.hits ?? 1;
+          const due = Math.min(hits - 1, Math.floor(k / (mv.hitInterval ?? mv.active)));
+          if (att.hitConnected <= due) {
+            const src: Source = { owner: att, actor: att, mv, kind: 'strike', dx: att.fx, dz: att.fz, moveFrame: att.moveFrame, isLast: att.hitConnected + 1 >= hits };
+            const limit = def.state === 'juggle' && def.juggleCount >= styleOf(att).juggleLimit;
+            if (!limit && !invulnerableTo(def, mv, 'strike') && hurtboxes(def).some((h) => hitTest(att, mv.hitbox!, h))) {
+              strikes.push({ src, def });
+            } else if (defAssist && (defAssist.state === 'attack' || defAssist.state === 'enter') && hitTest(att, mv.hitbox, assistHurt(defAssist))) {
+              strikes.push({ src, assist: defAssist });
+            }
+          }
+        }
+      }
     }
-    const hits = mv.hits ?? 1;
-    const interval = mv.hitInterval ?? mv.active;
-    const due = Math.min(hits - 1, Math.floor(k / interval));
-    if (att.hitConnected > due) continue;
-    if (def.state === 'juggle' && def.juggleCount >= styleOf(att).juggleLimit) continue;
-    if (invulnerableTo(def, mv, false)) continue;
-    const hb = toWorld(att, mv.hitbox);
-    if (!hurtboxes(def).some((h) => overlap(hb, h))) continue;
-    strikes.push([att, def, mv]);
+    const a = m.assists[s];
+    if (a && a.state === 'attack' && a.hitConnected === 0) {
+      const mv = assistMove(m, a);
+      const k = a.moveFrame - mv.startup;
+      if (mv.hitbox && k >= 0 && k < mv.active && !invulnerableTo(def, mv, 'assist')) {
+        const limit = def.state === 'juggle' && def.juggleCount >= styleOf(att).juggleLimit;
+        if (!limit && hurtboxes(def).some((h) => hitTest(a, mv.hitbox!, h))) {
+          strikes.push({ src: { owner: att, actor: a, mv, kind: 'assist', dx: a.fx, dz: a.fz, moveFrame: a.moveFrame, isLast: true }, def });
+          a.hitConnected = 1;
+        }
+      }
+    }
   }
   // simultaneous hits trade
-  for (const [att, def, mv] of strikes) applyHit(m, { att, mv }, def);
+  for (const s of strikes) {
+    if (s.src.kind === 'strike') s.src.owner.hitConnected++;
+    if (s.def) applyHit(m, s.src, s.def);
+    else if (s.assist && m.assists[s.assist.side] === s.assist) hitAssist(m, s.src, s.assist);
+  }
 
-  // projectiles: clash with each other, then hit fighters
+  // projectiles: clash with each other, then hit fighters and assists
   const ps = m.projectiles;
   for (let i = 0; i < ps.length; i++) {
     for (let j = i + 1; j < ps.length; j++) {
-      const p = ps[i], q = ps[j];
+      const p = ps[i];
+      const q = ps[j];
       if (p.owner === q.owner || p.life <= 0 || q.life <= 0) continue;
-      if (Math.abs(p.x - q.x) < 2600 && Math.abs(p.y - q.y) < 2600) {
+      if (len(p.x - q.x, p.z - q.z) < 2800 && Math.abs(p.y - q.y) < 2800) {
         p.life = 0;
         q.life = 0;
-        m.events.push({ type: 'block', side: p.owner, x: (p.x + q.x) >> 1, y: p.y, power: 2 });
+        emit(m, 'block', p.owner, (p.x + q.x) >> 1, p.y, (p.z + q.z) >> 1, 2);
       }
     }
   }
   for (const p of ps) {
-    if (p.life <= 0) continue;
+    if (p.life <= 0 || p.dodged) continue;
     const owner = m.fighters[p.owner];
     const def = m.fighters[1 - p.owner];
-    const mv = STYLES[owner.style].moves[p.moveId];
+    const mv = projMove(m, p);
     const pd = mv.projectile!;
-    const pb: Box = { x: p.x - (pd.w >> 1), y: p.y - (pd.h >> 1), w: pd.w, h: pd.h };
-    if (p.dodged) continue;
+    const src: Source = { owner, actor: { x: p.x, z: p.z, y: p.y, fx: p.dx, fz: p.dz }, mv, kind: 'projectile', dx: p.dx, dz: p.dz, moveFrame: 0, isLast: true };
+    const touches = (h: Hurt) => len(h.x - p.x, h.z - p.z) <= h.r + pd.r && p.y + pd.r > h.y0 && p.y - pd.r < h.y1;
+    const da = m.assists[1 - p.owner];
+    if (da && (da.state === 'attack' || da.state === 'enter') && touches(assistHurt(da))) {
+      p.life = 0;
+      hitAssist(m, src, da);
+      continue;
+    }
     if (def.state === 'juggle' && def.juggleCount >= styleOf(owner).juggleLimit) continue;
-    if (!hurtboxes(def).some((h) => overlap(pb, h))) continue;
-    if (invulnerableTo(def, mv, true)) {
-      if (def.state === 'move' && moveOf(def).tag === 'evade') p.dodged = true;
+    if (!hurtboxes(def).some(touches)) continue;
+    if (invulnerableTo(def, mv, 'projectile')) {
+      if (def.state === 'sidedash') p.dodged = true;
       continue;
     }
     p.life = 0;
-    applyHit(m, { att: owner, mv, projectile: p }, def);
+    applyHit(m, src, def);
   }
   m.projectiles = ps.filter((p) => p.life > 0);
+  resolveBeams(m);
 }
 
-function stepProjectiles(m: MatchState) {
-  for (const p of m.projectiles) {
-    p.x += p.vx;
-    p.age++;
-    p.life--;
-    if (Math.abs(p.x) > STAGE_HALF + 4000) p.life = 0;
+function beamTip(b: BeamState): [number, number] {
+  return [b.x + scale(b.len, b.dx), b.z + scale(b.len, b.dz)];
+}
+
+function resolveBeams(m: MatchState) {
+  for (let i = 0; i < m.beams.length; i++) {
+    const b = m.beams[i];
+    if (b.clashing || b.len === 0) continue;
+    const mv = beamMove(m, b);
+    const bd = mv.beam!;
+    const [tx, tz] = beamTip(b);
+    // two beams meet: a beam clash
+    for (let j = 0; j < m.beams.length; j++) {
+      const c = m.beams[j];
+      if (c.owner === b.owner || c.clashing || c.len === 0) continue;
+      const cw = beamMove(m, c).beam!.width;
+      const [cx, cz] = beamTip(c);
+      const near = bd.width + cw + 1500;
+      if (pointSegDist(tx, tz, c.x, c.z, cx, cz) <= near || pointSegDist(cx, cz, b.x, b.z, tx, tz) <= near) {
+        b.clashing = true;
+        c.clashing = true;
+        const pair: [number, number] = b.owner === 0 ? [i, j] : [j, i];
+        m.clash = { pos: 500, timer: CLASH_FRAMES, beams: pair, presses: [0, 0] };
+        emit(m, 'beamClash', b.owner, (tx + cx) >> 1, b.y, (tz + cz) >> 1, 3, 'BEAM CLASH');
+        return;
+      }
+    }
+    // beams burn through the other side's projectiles
+    for (const p of m.projectiles) {
+      if (p.owner !== b.owner && pointSegDist(p.x, p.z, b.x, b.z, tx, tz) <= bd.width + 1500) p.life = 0;
+    }
+    if (b.age % bd.hitEvery !== 0) continue;
+    const owner = m.fighters[b.owner];
+    const def = m.fighters[1 - b.owner];
+    const src: Source = { owner, actor: { x: b.x, z: b.z, y: b.y, fx: b.dx, fz: b.dz }, mv, kind: 'beam', dx: b.dx, dz: b.dz, moveFrame: 0, isLast: true };
+    const touches = (h: Hurt) => pointSegDist(h.x, h.z, b.x, b.z, tx, tz) <= bd.width + h.r && b.y + bd.width > h.y0 && b.y - bd.width < h.y1;
+    const da = m.assists[1 - b.owner];
+    if (da && da.state !== 'hit' && da.state !== 'leave' && touches(assistHurt(da))) hitAssist(m, src, da);
+    if (def.state === 'juggle' && def.juggleCount >= styleOf(owner).juggleLimit + 3) continue;
+    if (invulnerableTo(def, mv, 'beam')) continue;
+    const body = hurtboxes(def)[0];
+    if (body && touches(body)) applyHit(m, src, def);
+  }
+  m.projectiles = m.projectiles.filter((p) => p.life > 0);
+}
+
+// mash L, H or S to push the clash point into the other beam
+function stepClash(m: MatchState) {
+  const c = m.clash!;
+  for (const s of [0, 1] as const) {
+    const h = m.fighters[s].hist[m.fighters[s].hist.length - 1];
+    const n = popcount(h.pressed & ATTACKS);
+    c.presses[s] += n;
+    c.pos += (s === 0 ? 1 : -1) * n * CLASH_PUSH;
+  }
+  c.pos = Math.max(0, Math.min(1000, c.pos));
+  c.timer--;
+  if (c.pos >= 1000 || c.pos <= 0 || c.timer <= 0) endClash(m);
+}
+
+function endClash(m: MatchState) {
+  const c = m.clash!;
+  m.clash = null;
+  const beams = c.beams.map((i) => m.beams[i]);
+  const w = c.pos > 500 ? 0 : c.pos < 500 ? 1 : -1;
+  if (w >= 0) {
+    const winner = w as 0 | 1;
+    const wb = beams[winner];
+    const mv = beamMove(m, wb);
+    const loser = m.fighters[1 - winner];
+    const blast: MoveDef = { ...mv, damage: mv.beam!.clashDamage, launch: { fwd: 900, vy: 1200 }, knockdown: true, minScale: 100 };
+    const src: Source = { owner: m.fighters[winner], actor: { x: wb.x, z: wb.z, y: wb.y, fx: wb.dx, fz: wb.dz }, mv: blast, kind: 'beam', dx: wb.dx, dz: wb.dz, moveFrame: 0, isLast: true, force: true };
+    emit(m, 'clashWin', winner, loser.x, 12000, loser.z, 3, 'CLASH WIN');
+    applyHit(m, src, loser);
+  }
+  m.beams = m.beams.filter((b) => !beams.includes(b));
+  for (const b of beams) {
+    const f = m.fighters[b.owner];
+    const a = m.assists[b.owner];
+    if (b.fromAssist) {
+      if (a && a.state === 'attack') {
+        a.state = 'leave';
+        a.stateFrame = 0;
+      }
+    } else if (f.state === 'move' && moveOf(f).beam) endMove(f);
   }
 }
 
 // ---------------------------------------------------------------------------------------------- spacing
 
-function resolveSpacing(m: MatchState, prev: [number, number]) {
+function pushSpan(f: FighterState): [number, number] {
+  if (airborne(f)) return [f.y + 4000, f.y + 14000];
+  if (f.state === 'knockdown' || f.state === 'ko') return [0, 4000];
+  return [0, STAND_HEIGHT];
+}
+
+function resolveSpacing(m: MatchState) {
   const [a, b] = m.fighters;
   for (const f of m.fighters) {
     if (f.state === 'thrown') continue;
-    const lim = WALL;
-    if (f.x > lim || f.x < -lim) {
-      const dir: Facing = f.x > 0 ? 1 : -1;
-      f.x = dir * lim;
-      if (f.pendingWallSplat && (f.state === 'juggle' || f.state === 'hitstun')) {
-        const att = m.fighters[1 - f.side];
-        wallSplat(m, f, att);
+    const clamped = clampArena(f);
+    // knocked into the fence by a wall-splat move: pinned there
+    if (f.pendingWallSplat && (f.state === 'juggle' || f.state === 'hitstun') && (clamped || atWall(f))) wallSplat(m, f, m.fighters[1 - f.side]);
+    else if (clamped) {
+      if (f.state === 'juggle') {
+        f.vx = 0;
+        f.vz = 0;
       }
-      if (f.state === 'juggle') f.vx = 0;
+      f.kb = 0;
     }
   }
-  // pushboxes
-  if (a.state !== 'thrown' && b.state !== 'thrown') {
-    const [ay0, ay1] = pushSpan(a);
-    const [by0, by1] = pushSpan(b);
-    if (ay0 < by1 && by0 < ay1) {
-      const need = pushHalf(a) + pushHalf(b);
-      const dist = Math.abs(a.x - b.x);
-      if (dist < need) {
-        const ov = need - dist;
-        // who's on the left: by position, then by who was on the left before this frame
-        const aLeft = a.x !== b.x ? a.x < b.x : prev[0] !== prev[1] ? prev[0] < prev[1] : a.side === 0;
-        const s = aLeft ? -1 : 1;
-        const half = ov >> 1;
-        a.x += s * half;
-        b.x -= s * (ov - half);
-        for (const [f, o] of [[a, b], [b, a]] as const) {
-          if (f.x > WALL) {
-            o.x -= f.x - WALL;
-            f.x = WALL;
-          } else if (f.x < -WALL) {
-            o.x += -WALL - f.x;
-            f.x = -WALL;
-          }
-        }
-      }
-    }
-  }
-  // the camera holds both fighters: walking away at full distance is blocked
-  const dist = Math.abs(a.x - b.x);
-  if (dist > MAX_SEPARATION) {
-    const excess = dist - MAX_SEPARATION;
-    const awayA = Math.abs(a.x - b.x) - Math.abs(prev[0] - b.x);
-    const awayB = Math.abs(a.x - b.x) - Math.abs(a.x - prev[1]);
-    const f = awayA >= awayB ? a : b;
-    const o = f === a ? b : a;
-    f.x += (f.x < o.x ? 1 : -1) * excess;
+  if (a.state === 'thrown' || b.state === 'thrown') return;
+  const [ay0, ay1] = pushSpan(a);
+  const [by0, by1] = pushSpan(b);
+  if (!(ay0 < by1 && by0 < ay1)) return;
+  const need = 2 * BODY_R - 200;
+  for (let pass = 0; pass < 2; pass++) {
+    const d = len(b.x - a.x, b.z - a.z);
+    if (d >= need) return;
+    // push apart along the line between them (or across the facing when exactly on top of each other)
+    const [dx, dz] = norm(b.x - a.x, b.z - a.z, a.fx, a.fz);
+    const ov = need - d;
+    const half = ov >> 1;
+    const aStuck = len(a.x, a.z) >= LIM - 10 && scale(a.x, -dx) + scale(a.z, -dz) > 0;
+    const bStuck = len(b.x, b.z) >= LIM - 10 && scale(b.x, dx) + scale(b.z, dz) > 0;
+    const pa = aStuck ? 0 : bStuck ? ov : half;
+    const pb = ov - pa;
+    a.x -= scale(pa, dx);
+    a.z -= scale(pa, dz);
+    b.x += scale(pb, dx);
+    b.z += scale(pb, dz);
+    clampArena(a);
+    clampArena(b);
   }
 }
 
-function autoFace(f: FighterState, o: FighterState) {
-  if (airborne(f)) return;
-  if (actionable(f) || f.state === 'land' || f.state === 'getup' || f.state === 'knockdown') {
-    if (o.x !== f.x) f.facing = o.x > f.x ? 1 : -1;
+// lock-on: fighters keep facing each other while they can act; guarding turns slowly, so fast circling
+// and assists from the side can get behind a guard
+function lockOn(f: FighterState, o: FighterState) {
+  const [ux, uz] = toward(f, o);
+  switch (f.state) {
+    case 'idle':
+    case 'run':
+    case 'land':
+    case 'dashEnd':
+    case 'getup':
+    case 'parry':
+    case 'parryEnd':
+    case 'prejump':
+    case 'win':
+      f.fx = ux;
+      f.fz = uz;
+      break;
+    case 'guard':
+    case 'blockstun':
+    case 'air':
+      turnToward(f, ux, uz, 5);
+      break;
   }
+}
+
+// the shared camera looks across the line between the fighters and swings round as they circle
+function updateAxis(m: MatchState) {
+  const [a, b] = m.fighters;
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  if (len(dx, dz) < 6000) return;
+  let [tx, tz] = norm(dx, dz);
+  if (dotU(tx, tz, m.ax, m.az) < 0) {
+    tx = -tx;
+    tz = -tz;
+  }
+  [m.ax, m.az] = norm(m.ax * 11 + tx, m.az * 11 + tz, m.ax, m.az);
 }
 
 // ---------------------------------------------------------------------------------------------- meters
@@ -1234,18 +1639,18 @@ function regen(m: MatchState, f: FighterState) {
         f.burnout = false;
       }
     } else if (f.state !== 'parry' && f.state !== 'hitstun' && f.state !== 'blockstun' && !(f.state === 'move' && moveOf(f).kind === 'drive')) {
-      f.drive = Math.min(DRIVE_MAX, f.drive + (f.state === 'walkF' ? DRIVE_REGEN * 2 : DRIVE_REGEN));
+      f.drive = Math.min(DRIVE_MAX, f.drive + DRIVE_REGEN);
     }
   }
-  if (f.heatTimer > 0) f.heatTimer--;
-  if (f.driveRushBuff > 0) f.driveRushBuff--;
+  // the assist cooldown starts when the partner has left
+  if (f.assistCD > 0 && !m.assists[f.side]) f.assistCD--;
+  if (f.tagCD > 0) f.tagCD--;
   if (m.training?.infiniteMeter) {
     if (st.drive) {
       f.drive = DRIVE_MAX;
       f.burnout = false;
     }
     if (st.supers) f.superMeter = SUPER_MAX;
-    if (st.heat && f.heatTimer <= 0) f.heatAvailable = true;
   }
 }
 
@@ -1255,16 +1660,23 @@ export function step(m: MatchState, raw: [number, number]) {
   m.events = [];
   m.frame++;
   const [a, b] = m.fighters;
-  for (const f of m.fighters) pushInput(f.hist, m.frame, m.phase === 'fight' ? raw[f.side] : 0, f.facing);
+  for (const f of m.fighters) {
+    const [ux, uz] = toward(f, m.fighters[1 - f.side]);
+    pushInput(f.hist, m.frame, m.phase === 'fight' ? raw[f.side] : 0, m.ax, m.az, ux, uz);
+  }
 
   if (m.phase === 'intro') {
     m.phaseFrame++;
-    if (m.phaseFrame === 1) m.events.push({ type: 'round', side: 0, x: 0, y: 12000, power: m.round, text: `ROUND ${m.round}` });
+    if (m.phaseFrame === 1) emit(m, 'round', 0, 0, 12000, 0, m.round, `ROUND ${m.round}`);
     if (m.phaseFrame >= 100) {
       m.phase = 'fight';
       m.phaseFrame = 0;
-      m.events.push({ type: 'fight', side: 0, x: 0, y: 12000, power: 1, text: 'FIGHT!' });
+      emit(m, 'fight', 0, 0, 12000, 0, 1, 'FIGHT!');
     }
+    return;
+  }
+  if (m.clash) {
+    stepClash(m);
     return;
   }
   if (m.freeze > 0) {
@@ -1273,18 +1685,23 @@ export function step(m: MatchState, raw: [number, number]) {
   }
   m.phaseFrame++;
 
-  const prev: [number, number] = [a.x, b.x];
   if (m.phase === 'fight') {
     control(m, a, b);
     control(m, b, a);
   }
   advance(m, a, b);
   advance(m, b, a);
+  for (const s of [0, 1] as const) {
+    const as = m.assists[s];
+    if (as) advanceAssist(m, as);
+  }
   stepProjectiles(m);
-  resolveSpacing(m, prev);
+  stepBeams(m);
+  resolveSpacing(m);
   if (m.phase === 'fight') resolveHits(m);
-  autoFace(a, b);
-  autoFace(b, a);
+  lockOn(a, b);
+  lockOn(b, a);
+  updateAxis(m);
   regen(m, a);
   regen(m, b);
   trackAdvantage(m);
@@ -1317,10 +1734,9 @@ function trainingRules(m: MatchState) {
   }
   const [a, b] = m.fighters;
   if (m.training?.autoRefill && actionable(a) && actionable(b)) {
-    const idle = m.frame - Math.max(a.actionableSince, b.actionableSince);
-    if (idle >= 45) {
-      a.health = MAX_HEALTH;
-      b.health = MAX_HEALTH;
+    if (m.frame - Math.max(a.actionableSince, b.actionableSince) >= 45) {
+      a.health = styleOf(a).health;
+      b.health = styleOf(b).health;
     }
   }
 }
@@ -1329,13 +1745,16 @@ function roundRules(m: MatchState) {
   const [a, b] = m.fighters;
   if (m.phase === 'fight') {
     m.timer--;
-    const koA = a.health <= 0, koB = b.health <= 0;
+    const koA = a.health <= 0;
+    const koB = b.health <= 0;
     if (koA || koB || m.timer <= 0) {
-      if (!koA && !koB) m.events.push({ type: 'timeover', side: 0, x: 0, y: 12000, power: 1, text: 'TIME' });
+      if (!koA && !koB) emit(m, 'timeover', 0, 0, 12000, 0, 1, 'TIME');
       m.phase = 'ko';
       m.phaseFrame = 0;
       m.winner = koA && koB ? 2 : koA ? 1 : koB ? 0 : a.health === b.health ? 2 : a.health > b.health ? 0 : 1;
       m.projectiles = [];
+      m.beams = [];
+      m.assists = [null, null];
     }
     return;
   }
@@ -1354,20 +1773,12 @@ function roundRules(m: MatchState) {
         m.phase = 'matchEnd';
         m.phaseFrame = 0;
         m.winner = a.roundWins === b.roundWins ? 2 : a.roundWins > b.roundWins ? 0 : 1;
-      } else {
-        nextRound(m);
-      }
+      } else nextRound(m);
     }
   }
 }
 
-function nextRound(m: MatchState) {
-  m.round++;
-  m.phase = 'intro';
-  m.phaseFrame = 0;
-  m.timer = ROUND_SECONDS * FPS;
-  m.winner = -1;
-  m.projectiles = [];
+function freshFighters(m: MatchState) {
   m.fighters = m.fighters.map((f) => {
     const n = createFighter(f.side, f.style);
     n.roundWins = f.roundWins;
@@ -1376,21 +1787,24 @@ function nextRound(m: MatchState) {
     n.hist = f.hist;
     return n;
   }) as [FighterState, FighterState];
+  m.assists = [null, null];
+  m.projectiles = [];
+  m.beams = [];
+  m.clash = null;
+  m.ax = ONE;
+  m.az = 0;
+}
+
+function nextRound(m: MatchState) {
+  m.round++;
+  m.phase = 'intro';
+  m.phaseFrame = 0;
+  m.timer = ROUND_SECONDS * FPS;
+  m.winner = -1;
+  freshFighters(m);
 }
 
 export function resetPositions(m: MatchState) {
-  m.fighters = m.fighters.map((f) => {
-    const n = createFighter(f.side, f.style);
-    n.hist = f.hist;
-    n.superMeter = f.superMeter;
-    return n;
-  }) as [FighterState, FighterState];
-  m.projectiles = [];
+  freshFighters(m);
   m.freeze = 0;
 }
-
-export function isRage(f: FighterState) {
-  return rageActive(f);
-}
-
-export const SUPER_BAR_SIZE = SUPER_BAR;

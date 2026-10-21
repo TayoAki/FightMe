@@ -1,8 +1,8 @@
-// The in-fight HUD: health, timer, round wins, Drive / super / Heat / Rage gauges, combo counters, popups,
-// the announcer and the training readout. Plain DOM, updated only when a value changes.
+// The in-fight HUD: health, timer, round wins, Drive and super gauges, the Tag team's assist and tag
+// cooldowns, combo counters, popups, the beam-clash mash meter, the announcer and the training readout.
+// Plain DOM, updated only when a value changes.
 
-import { DRIVE_BAR, DRIVE_MAX, FPS, HEAT_FRAMES, MAX_HEALTH, RAGE_THRESHOLD, ROUNDS_TO_WIN, SUPER_BAR } from '../sim/constants';
-import { isRage } from '../sim/match';
+import { ASSIST_COOLDOWN, DRIVE_BAR, FPS, MAX_HEALTH, ROUNDS_TO_WIN, SUPER_BAR, TAG_COOLDOWN } from '../sim/constants';
 import { STYLES } from '../sim/styles';
 import type { FighterState, GameEvent, MatchState } from '../sim/types';
 
@@ -19,14 +19,15 @@ interface SideEls {
   fill: HTMLElement;
   lag: HTMLElement;
   wins: HTMLElement;
-  meters: HTMLElement;
+  driveRow: HTMLElement;
   drive: HTMLElement[];
   driveLabel: HTMLElement;
+  supRow: HTMLElement;
   sup: HTMLElement[];
   supLabel: HTMLElement;
-  heat: HTMLElement;
-  heatFill: HTMLElement;
-  rage: HTMLElement;
+  teamRow: HTMLElement;
+  assist: HTMLElement;
+  tag: HTMLElement;
   combo: HTMLElement;
   hits: HTMLElement;
   dmg: HTMLElement;
@@ -40,11 +41,16 @@ export class Hud {
   private announce: HTMLElement;
   private flash: HTMLElement;
   private dim: HTMLElement;
+  private clash: HTMLElement;
+  private clashFill: HTMLElement;
   private training: HTMLElement;
   private trainLines: HTMLElement[] = [];
   private lagHealth = [MAX_HEALTH, MAX_HEALTH];
   private comboShow = [0, 0];
-  private comboLast = [{ hits: 0, dmg: 0 }, { hits: 0, dmg: 0 }];
+  private comboLast = [
+    { hits: 0, dmg: 0 },
+    { hits: 0, dmg: 0 },
+  ];
   private cache = new Map<HTMLElement, string>();
   names: [string, string] = ['P1', 'P2'];
 
@@ -72,17 +78,19 @@ export class Hud {
       const supRow = h('div', 'hud-row super', meters);
       const supLabel = h('span', 'hud-label', supRow, 'SUPER');
       const sup = Array.from({ length: 3 }, () => h('div', 'seg big', supRow));
-      const heat = h('div', 'hud-row heat', meters);
-      h('span', 'hud-label', heat, 'HEAT');
-      const heatBar = h('div', 'heat-bar', heat);
-      const heatFill = h('div', 'heat-fill', heatBar);
-      const rage = h('div', 'hud-rage', meters, 'RAGE');
+      const teamRow = h('div', 'hud-row team', meters);
+      const assist = h('div', 'pill', teamRow, 'ASSIST');
+      const tag = h('div', 'pill', teamRow, 'TAG');
       const combo = h('div', `hud-combo p${i + 1}`, this.root);
       const hits = h('div', 'hits', combo);
       const dmg = h('div', 'dmg', combo);
       const pops = h('div', `hud-pops p${i + 1}`, this.root);
-      this.sides.push({ ...s, meters, drive, driveLabel, sup, supLabel, heat, heatFill, rage, combo, hits, dmg, pops });
+      this.sides.push({ ...s, driveRow, drive, driveLabel, supRow, sup, supLabel, teamRow, assist, tag, combo, hits, dmg, pops });
     });
+    this.clash = h('div', 'hud-clash', this.root);
+    h('div', 'clash-title', this.clash, 'MASH!');
+    const clashBar = h('div', 'clash-bar', this.clash);
+    this.clashFill = h('div', 'clash-fill', clashBar);
     this.announce = h('div', 'hud-announce', this.root);
     this.flash = h('div', 'hud-flash', this.root);
     this.dim = h('div', 'hud-dim', this.root);
@@ -103,8 +111,12 @@ export class Hud {
   update(m: MatchState, dummyLabel = '') {
     const training = !!m.training;
     this.timer.style.visibility = training ? 'hidden' : '';
-    this.set(this.timer, String(Math.ceil(m.timer / FPS)), () => (this.timer.textContent = String(Math.max(0, Math.ceil(m.timer / FPS)))));
+    const secs = String(Math.max(0, Math.ceil(m.timer / FPS)));
+    this.set(this.timer, secs, () => (this.timer.textContent = secs));
     m.fighters.forEach((f, i) => this.side(m, f, i));
+    // beam clash: the bar shows how far P1 has pushed
+    this.clash.style.display = m.clash ? '' : 'none';
+    if (m.clash) this.clashFill.style.transform = `scaleX(${m.clash.pos / 1000})`;
     this.training.style.display = training ? '' : 'none';
     if (training) {
       const last = m.lastMove[0] || '-';
@@ -118,46 +130,44 @@ export class Hud {
       ];
       lines.forEach((html, k) => this.set(this.trainLines[k], html, () => (this.trainLines[k].innerHTML = html)));
     }
-    this.dim.style.opacity = m.freeze > 20 ? '1' : '0';
+    this.dim.style.opacity = m.freeze > 20 || m.clash ? '1' : '0';
   }
 
   private side(m: MatchState, f: FighterState, i: number) {
     const s = this.sides[i];
     const st = STYLES[f.style];
-    this.set(s.name, this.names[i] + st.name, () => (s.name.innerHTML = `<b>${this.names[i]}</b> · ${st.name.toUpperCase()}`));
-    const hp = Math.max(0, f.health) / MAX_HEALTH;
+    const who = st.team ? st.kits.map((k, c) => (c === f.char ? `<b class="on">${k.name.toUpperCase()}</b>` : k.name.toUpperCase())).join(' ⇄ ') : st.name.toUpperCase();
+    this.set(s.name, this.names[i] + who, () => (s.name.innerHTML = `<b>${this.names[i]}</b> · ${who}`));
+    const max = st.health;
+    const hp = Math.max(0, f.health) / max;
     this.set(s.fill, hp.toFixed(4), () => {
       s.fill.style.transform = `scaleX(${hp})`;
-      s.fill.classList.toggle('low', f.health <= RAGE_THRESHOLD);
+      s.fill.classList.toggle('low', f.health <= max / 4);
     });
     // the red "damage trail" catches up after a combo ends
     const comboing = f.state === 'hitstun' || f.state === 'juggle' || f.state === 'wallsplat' || f.state === 'crumple';
     if (!comboing || f.health > this.lagHealth[i]) this.lagHealth[i] += (f.health - this.lagHealth[i]) * (f.health > this.lagHealth[i] ? 1 : 0.08);
-    const lag = Math.max(0, this.lagHealth[i]) / MAX_HEALTH;
+    const lag = Math.max(0, this.lagHealth[i]) / max;
     this.set(s.lag, lag.toFixed(3), () => (s.lag.style.transform = `scaleX(${lag})`));
     const wins = '●'.repeat(f.roundWins) + '○'.repeat(Math.max(0, ROUNDS_TO_WIN - f.roundWins));
     this.set(s.wins, wins, () => (s.wins.textContent = m.training ? '' : wins));
     // gauges
-    const drive = st.drive;
-    s.drive[0].parentElement!.style.display = drive ? '' : 'none';
-    s.sup[0].parentElement!.style.display = st.supers ? '' : 'none';
-    s.heat.style.display = st.heat ? '' : 'none';
-    if (drive) {
-      const key = `${Math.floor(f.drive / 250)}|${f.burnout}`;
-      this.set(s.drive[0].parentElement!, key, () => {
+    s.driveRow.style.display = st.drive ? '' : 'none';
+    s.supRow.style.display = st.supers ? '' : 'none';
+    s.teamRow.style.display = st.team ? '' : 'none';
+    if (st.drive) {
+      this.set(s.driveRow, `${Math.floor(f.drive / 250)}|${f.burnout}`, () => {
         s.drive.forEach((seg, k) => {
           const v = Math.min(1, Math.max(0, (f.drive - k * DRIVE_BAR) / DRIVE_BAR));
           seg.style.setProperty('--v', String(v));
           seg.classList.toggle('full', v >= 1);
         });
         s.driveLabel.textContent = f.burnout ? 'BURNOUT' : 'DRIVE';
-        s.drive[0].parentElement!.classList.toggle('burnout', f.burnout);
+        s.driveRow.classList.toggle('burnout', f.burnout);
       });
-      void DRIVE_MAX;
     }
     if (st.supers) {
-      const key = String(Math.floor(f.superMeter / 200));
-      this.set(s.sup[0].parentElement!, key, () => {
+      this.set(s.supRow, String(Math.floor(f.superMeter / 200)), () => {
         s.sup.forEach((seg, k) => {
           const v = Math.min(1, Math.max(0, (f.superMeter - k * SUPER_BAR) / SUPER_BAR));
           seg.style.setProperty('--v', String(v));
@@ -166,17 +176,24 @@ export class Hud {
         s.supLabel.textContent = `SUPER ${Math.floor(f.superMeter / SUPER_BAR)}`;
       });
     }
-    if (st.heat) {
-      const v = f.heatTimer > 0 ? f.heatTimer / HEAT_FRAMES : f.heatAvailable ? 1 : 0;
-      const key = `${v.toFixed(3)}|${f.heatTimer > 0}`;
-      this.set(s.heatFill, key, () => {
-        s.heatFill.style.transform = `scaleX(${v})`;
-        s.heat.classList.toggle('active', f.heatTimer > 0);
-        s.heat.classList.toggle('spent', !f.heatAvailable && f.heatTimer <= 0);
+    if (st.team) {
+      const partner = st.kits[1 - f.char].name.toUpperCase();
+      const out = !!m.assists[i];
+      const aReady = !out && f.assistCD === 0;
+      const aText = out ? `${partner} IN` : aReady ? `ASSIST ${partner}` : `ASSIST ${Math.ceil(f.assistCD / FPS)}s`;
+      this.set(s.assist, aText, () => {
+        s.assist.textContent = aText;
+        s.assist.classList.toggle('ready', aReady);
+        s.assist.style.setProperty('--v', String(aReady || out ? 1 : 1 - Math.min(1, f.assistCD / ASSIST_COOLDOWN)));
+      });
+      const tReady = f.tagCD === 0;
+      const tText = tReady ? `TAG ${partner}` : `TAG ${Math.ceil(f.tagCD / FPS)}s`;
+      this.set(s.tag, tText, () => {
+        s.tag.textContent = tText;
+        s.tag.classList.toggle('ready', tReady);
+        s.tag.style.setProperty('--v', String(tReady ? 1 : 1 - f.tagCD / TAG_COOLDOWN));
       });
     }
-    const rage = isRage(f);
-    s.rage.style.display = rage ? '' : 'none';
     // combo counter for the attacker
     const def = m.fighters[1 - i];
     if (def.comboHits >= 2 && (def.state === 'hitstun' || def.state === 'juggle' || def.state === 'wallsplat' || def.state === 'crumple' || def.state === 'stagger' || def.state === 'knockdown' || def.state === 'ko')) {
@@ -206,14 +223,8 @@ export class Hud {
           this.pop(e.side, 'PERFECT PARRY', 'green');
           this.screenFlash(0.6);
           break;
-        case 'justFrame':
-          this.pop(e.side, 'PERFECT ⚡', 'blue');
-          break;
         case 'wallSplat':
           this.pop(1 - e.side, 'WALL SPLAT', 'orange');
-          break;
-        case 'tornado':
-          this.pop(1 - e.side, 'TORNADO', 'white');
           break;
         case 'tech':
           this.pop(0, 'TECH', 'white');
@@ -231,12 +242,29 @@ export class Hud {
         case 'driveRush':
           this.pop(e.side, 'DRIVE RUSH', 'green');
           break;
+        case 'assist':
+          this.pop(e.side, `${e.text} ASSIST`, 'blue');
+          break;
+        case 'assistHit':
+          this.pop(1 - e.side, 'ASSIST HIT', 'red');
+          break;
+        case 'tagSwap':
+          this.pop(e.side, e.text ?? 'TAG', 'blue');
+          break;
+        case 'teleport':
+          this.pop(e.side, 'BLINK', 'white');
+          break;
         case 'super':
-        case 'rageArt':
-        case 'heatSmash':
-        case 'heat':
-          this.pop(e.side, (e.text ?? '').toUpperCase(), e.type === 'super' ? 'gold' : 'orange');
+          this.pop(e.side, (e.text ?? '').toUpperCase(), 'gold');
           this.screenFlash(0.35);
+          break;
+        case 'beamClash':
+          this.say('BEAM CLASH', 1200, 'clash');
+          this.screenFlash(0.5);
+          break;
+        case 'clashWin':
+          this.pop(e.side, 'CLASH WIN', 'gold');
+          this.screenFlash(0.7);
           break;
         case 'armor':
           this.pop(e.side, 'ARMOR', 'white');

@@ -147,5 +147,4 @@ export const POSES: Record<string, PoseSpec> = {
   evade: over(STANCE, { root: [0, -0.18, -0.12], hips: [-5, -55, -8], chest: [-14, -20, -12], head: [-5, 50, 0], lh: [0.15, 1.35, 0.25], rh: [-0.15, 1.3, 0.05], lf: [0.16, 0, 0.12], rf: [-0.14, 0, -0.38] }),
 };
 
-export const AIR_POSES = new Set(['airPunch', 'airHammer', 'airKnee', 'airKick', 'airKickHeavy']);
 export const CROUCH_POSES = new Set(['crJab', 'crPunch', 'crKickLow', 'crKickMid', 'sweep']);

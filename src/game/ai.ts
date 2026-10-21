@@ -2,28 +2,61 @@
 // like a player's controller, so the simulation can't tell them apart.
 
 import { IN } from '../sim/input';
-import { actionable, isRage, moveOf } from '../sim/match';
+import { actionable, moveOf } from '../sim/match';
+import { STYLES } from '../sim/styles';
 import type { FighterState, MatchState, TrainingOptions } from '../sim/types';
+import { len, norm } from '../sim/vec';
 
-const { UP, DOWN, LEFT, RIGHT, B1, B2, B3, B4, B5, B6 } = IN;
-// symbolic directions, resolved against the fighter's facing when the input is sent
-const F = 1 << 14;
-const B = 1 << 15;
+const { UP, DOWN, LEFT, RIGHT, L, H, S, J, G, D } = IN;
+// symbolic directions, turned into stick bits against the camera when the input is sent
+const T = 1 << 16; // toward the opponent
+const A = 1 << 17; // away
+const SIDE = 1 << 18; // circling one way
+const SIDE2 = 1 << 19; // circling the other way
+const SYMBOLIC = T | A | SIDE | SIDE2;
 
 type Step = [bits: number, frames: number];
 
-function resolve(bits: number, facing: 1 | -1): number {
-  let out = bits & ~(F | B);
-  if (bits & F) out |= facing === 1 ? RIGHT : LEFT;
-  if (bits & B) out |= facing === 1 ? LEFT : RIGHT;
+// stick bits that push the fighter along a ground direction, given the camera's axis
+function stickFor(m: MatchState, wx: number, wz: number): number {
+  const h = (wx * m.ax + wz * m.az) / (1024 * 1024);
+  const v = (wx * m.az - wz * m.ax) / (1024 * 1024);
+  let out = 0;
+  if (h > 0.38) out |= RIGHT;
+  if (h < -0.38) out |= LEFT;
+  if (v > 0.38) out |= UP;
+  if (v < -0.38) out |= DOWN;
   return out;
 }
 
-const QCF = (btn: number): Step[] => [[DOWN, 1], [DOWN | F, 1], [F | btn, 2]];
-const DP = (btn: number): Step[] => [[F, 1], [0, 1], [DOWN, 1], [DOWN | F | btn, 2]];
-const QCB = (btn: number): Step[] => [[DOWN, 1], [DOWN | B, 1], [B | btn, 2]];
-const tap = (bits: number, hold = 2): Step[] => [[bits, hold]];
+function resolve(m: MatchState, me: FighterState, bits: number): number {
+  if (!(bits & SYMBOLIC)) return bits;
+  const o = m.fighters[1 - me.side];
+  const [ux, uz] = norm(o.x - me.x, o.z - me.z, me.fx, me.fz);
+  let wx = 0;
+  let wz = 0;
+  if (bits & T) {
+    wx += ux;
+    wz += uz;
+  }
+  if (bits & A) {
+    wx -= ux;
+    wz -= uz;
+  }
+  if (bits & SIDE) {
+    wx += -uz;
+    wz += ux;
+  }
+  if (bits & SIDE2) {
+    wx -= -uz;
+    wz -= ux;
+  }
+  return (bits & ~SYMBOLIC) | stickFor(m, wx, wz);
+}
+
+const tap = (bits: number, hold = 2): Step[] => [[bits, hold], [0, 1]];
 const wait = (n: number): Step[] => [[0, n]];
+const string = (btn: number, n: number, gap = 9): Step[] => Array.from({ length: n }, () => [...tap(btn), ...wait(gap)]).flat();
 
 interface Plans {
   far: Array<() => Step[]>;
@@ -33,220 +66,238 @@ interface Plans {
   punish: () => Step[];
 }
 
-// far: over 15 m-units away, mid: closing the gap, close: inside poke range (about 0.9 m)
 const STREET: Plans = {
   far: [
-    () => [...QCF(B3), ...wait(20)],
-    () => [[F, 22]] as Step[],
-    () => [[F, 14]] as Step[],
-    () => [[UP | F, 3], ...wait(14), ...tap(B6), ...wait(14), ...tap(DOWN | B5), ...wait(4), ...QCF(B3)],
+    () => [...tap(S), ...wait(30)],
+    () => [...tap(D), ...wait(22), ...string(L, 3)],
+    () => [[T, 24]],
+    () => [[SIDE, 18]],
+    () => [...tap(D), ...wait(24), ...tap(H), ...wait(10), ...tap(S), ...wait(20)],
   ],
   mid: [
-    () => [[F, 14]] as Step[],
-    () => [[F, 10]] as Step[],
-    () => [...QCF(B2), ...wait(16)],
-    () => [[F, 1], [0, 1], [F, 10]] as Step[],
-    () => [...tap(B3 | B6), ...wait(40)],
-    () => [[UP | F, 3], ...wait(14), ...tap(B6), ...wait(14), ...tap(DOWN | B5), ...wait(4), ...QCF(B3)],
+    () => [...tap(D), ...wait(12), ...string(L, 3)],
+    () => [...tap(T | H), ...wait(20)],
+    () => [...tap(S), ...wait(30)],
+    () => [[T, 12]],
+    () => [[G, 20]],
+    () => [...tap(SIDE | D), ...wait(18)],
+    () => [...tap(D), ...wait(10), ...tap(L | G), ...wait(30)],
   ],
   close: [
-    () => [...tap(DOWN | B5), ...wait(4), ...QCF(B3), ...wait(10)],
-    () => [...tap(B5), ...wait(18)],
-    () => [...tap(B1), ...wait(4), ...tap(B1), ...wait(4), ...tap(DOWN | B5), ...wait(4), ...QCF(B3)],
-    () => [...tap(B3), ...wait(10), ...tap(B6), ...wait(30)],
-    () => [...tap(B1 | B4), ...wait(30)],
-    () => [...tap(DOWN | B4), ...wait(4), ...tap(DOWN | B1), ...wait(6), ...QCB(B5)],
-    () => [...tap(F | B2), ...wait(24)],
-    () => [[B, 10]] as Step[],
-    () => [...tap(DOWN | B6), ...wait(30)],
-    () => [[DOWN | B, 16]] as Step[],
+    () => string(L, 3),
+    () => [...tap(H), ...wait(10), ...tap(S), ...wait(30)],
+    () => [...tap(H), ...wait(10), ...tap(T | S), ...wait(40)],
+    () => [...tap(SIDE | H), ...wait(30)],
+    () => [...tap(L | G), ...wait(30)],
+    () => [[G, 24]],
+    () => [...tap(SIDE2 | D), ...wait(14), ...string(L, 2)],
+    () => [...tap(A | D), ...wait(20)],
+    () => [...tap(H | S), ...wait(50)],
+    () => [[L | H, 18], ...wait(6)],
+    () => [...tap(A | S), ...wait(40)],
   ],
-  antiAir: () => [...DP(B3), ...wait(30)],
-  punish: () => [...tap(B3), ...wait(8), ...QCF(B3)],
+  antiAir: () => [...tap(T | S), ...wait(40)],
+  punish: () => [...tap(H), ...wait(10), ...tap(T | S), ...wait(40)],
 };
 
-// Iron limbs: 1 = B1, 2 = B2, 3 = B4, 4 = B5, Heat = B3
-const IRON: Plans = {
+const VOLT: Plans = {
   far: [
-    () => [[F, 1], [0, 1], [F, 14]] as Step[],
-    () => [[F, 20]] as Step[],
-    () => [[F, 12]] as Step[],
-    () => [[0, 12]] as Step[],
+    () => [...tap(D), ...wait(20), ...string(L, 4, 8)],
+    () => [...tap(S), ...wait(36)],
+    () => [[T, 22]],
+    () => [[SIDE, 16]],
+    () => [...tap(L | H), ...wait(4), ...tap(D), ...wait(20), ...string(L, 4, 8)],
   ],
   mid: [
-    () => [[F, 1], [0, 1], [F, 8]] as Step[],
-    () => [[F, 14]] as Step[],
-    () => [[F, 1], [0, 1], [F, 6], ...tap(F | B2), ...wait(20)],
-    () => [[F, 1], [0, 1], [F, 6], ...tap(DOWN | F | B1), ...wait(12)],
-    () => [[0, 10]] as Step[],
+    () => [...tap(D), ...wait(10), ...string(L, 4, 8)],
+    () => [...tap(T | H), ...wait(28)],
+    () => [...tap(S), ...wait(36)],
+    () => [...tap(SIDE | D), ...wait(16)],
+    () => [[G, 18]],
   ],
   close: [
-    () => [...tap(B1), ...wait(4), ...tap(B2), ...wait(6), ...tap(B5), ...wait(24)],
-    () => [...tap(DOWN | F | B1), ...wait(14)],
-    () => [...tap(DOWN | F | B1), ...wait(10), ...tap(DOWN | F | B1), ...wait(12)],
-    () => [...tap(DOWN | F | B2), ...wait(22), ...tap(B1), ...wait(6), ...tap(B1), ...wait(3), ...tap(B2), ...wait(14), ...tap(B4), ...wait(5), ...tap(B2), ...wait(22), ...tap(F | B2)],
-    () => [[F, 1], [0, 1], [DOWN, 1], [DOWN | F | B2, 2], ...wait(26), ...tap(B4), ...wait(5), ...tap(B2), ...wait(20)],
-    () => [...tap(B1 | B4), ...wait(30)],
-    () => [...tap(DOWN | B5), ...wait(16)],
-    () => [...tap(DOWN | F | B5), ...wait(20)],
-    () => [...tap(F | B2), ...wait(24)],
-    () => [...tap(B5), ...wait(20)],
-    () => [...tap(DOWN | B, 2), ...tap(DOWN | B | B4), ...wait(30)],
-    () => [[DOWN, 1], [0, 1], [DOWN, 1], ...wait(18)],
-    () => [[0, 14]] as Step[],
+    () => string(L, 4, 8),
+    () => [...tap(H), ...wait(24), ...string(L, 2, 10), ...tap(H | S), ...wait(30)],
+    () => [...tap(L), ...wait(6), ...tap(L | H), ...wait(4), ...string(L, 3, 8)],
+    () => [...tap(SIDE | H), ...wait(30)],
+    () => [...tap(L | G), ...wait(30)],
+    () => [[G, 22]],
+    () => [...tap(A | S), ...wait(30)],
+    () => [...tap(SIDE2 | D), ...wait(14), ...string(L, 3, 8)],
   ],
-  antiAir: () => [...tap(UP | F | B5), ...wait(26)],
-  punish: () => [...tap(DOWN | F | B2), ...wait(24), ...tap(B4), ...wait(5), ...tap(B2), ...wait(20)],
+  antiAir: () => [...tap(T | S), ...wait(36)],
+  punish: () => [...tap(H), ...wait(24), ...string(L, 3, 10)],
 };
+
+const NOVA: Plans = {
+  far: [
+    () => [...tap(S), ...wait(30)],
+    () => [...tap(T | S), ...wait(30)],
+    () => [...tap(L | H), ...wait(20), ...tap(S), ...wait(26)],
+    () => [[SIDE, 18]],
+    () => [[0, 14]],
+  ],
+  mid: [
+    () => [...tap(S), ...wait(30)],
+    () => [...tap(H), ...wait(24)],
+    () => [...tap(A | D), ...wait(10), ...tap(S), ...wait(26)],
+    () => [...tap(SIDE | D), ...wait(16), ...tap(S), ...wait(26)],
+    () => [...tap(H | S), ...wait(30)],
+  ],
+  close: [
+    () => string(L, 2, 10),
+    () => [...tap(H), ...wait(24)],
+    () => [...tap(T | H), ...wait(26)],
+    () => [...tap(A | S), ...wait(36)],
+    () => [...tap(L | G), ...wait(30)],
+    () => [[G, 22]],
+    () => [...tap(A | D), ...wait(12), ...tap(S), ...wait(26)],
+    () => [...tap(L | H), ...wait(6), ...string(L, 2, 10)],
+  ],
+  antiAir: () => [...tap(A | H), ...wait(30)],
+  punish: () => [...tap(T | H), ...wait(26), ...string(L, 2, 10)],
+};
+
+const plansFor = (f: FighterState): Plans => (f.style === 'street' ? STREET : f.char === 0 ? VOLT : NOVA);
 
 export class Cpu {
   private queue: Step[] = [];
   private hold = 0;
   private cooldown = 0;
-  private blockFor = 0;
+  private guardFor = 0;
   private dodgeRoll = -1;
-  constructor(private side: 0 | 1, public level = 1) {}
+  private mashTick = 0;
+  constructor(
+    private side: 0 | 1,
+    public level = 1,
+  ) {}
 
   reset() {
     this.queue = [];
     this.hold = 0;
     this.cooldown = 0;
-    this.blockFor = 0;
-  }
-
-  think(m: MatchState): number {
-    const me = m.fighters[this.side];
-    const op = m.fighters[1 - this.side];
-    const facing = me.facing;
-    if (m.phase !== 'fight') {
-      this.reset();
-      return 0;
-    }
-    // a fireball about to arrive interrupts walking and waiting (not attacks already being input)
-    const skill0 = [0.35, 0.6, 0.85][this.level] ?? 0.6;
-    const eta = projectileEta(m, me);
-    if (eta >= 0 && eta <= 12 && (!this.queue.length || (this.queue[0][0] & (B1 | B2 | B3 | B4 | B5 | B6)) === 0) && actionable(me)) {
-      if (this.dodgeRoll < 0) this.dodgeRoll = Math.random();
-      if (this.dodgeRoll < skill0) {
-        this.queue = [];
-        if (me.style === 'iron' && eta <= 9 && eta >= 2 && this.dodgeRoll < skill0 * 0.8) this.plan([[DOWN, 1], [0, 1], [DOWN, 1], ...wait(16)]);
-        else this.blockFor = Math.max(this.blockFor, eta + 10);
-      }
-    } else if (eta < 0) this.dodgeRoll = -1;
-    // finish the current plan
-    if (this.queue.length) {
-      const step = this.queue[0];
-      const bits = step[0];
-      if (++this.hold >= step[1]) {
-        this.queue.shift();
-        this.hold = 0;
-      }
-      return resolve(bits, facing);
-    }
-    // grabbed: try to tech (reaction-based, so not every time)
-    if (me.state === 'thrown') {
-      if (me.stateFrame >= 3 && Math.random() < (skill0 * 0.6) / 4) return B1 | B4;
-      return 0;
-    }
-    // defence: block attacks that are coming
-    if (this.blockFor > 0) {
-      this.blockFor--;
-      return resolve(guardFor(me, op), facing);
-    }
-    if (!actionable(me)) return 0;
-    const dist = Math.abs(op.x - me.x);
-    const threat = isThreat(op, me, dist, m);
-    const skill = [0.35, 0.6, 0.85][this.level] ?? 0.6;
-    if (threat && Math.random() < skill * 0.55) {
-      this.blockFor = 14 + Math.floor(Math.random() * 10);
-      return resolve(guardFor(me, op), facing);
-    }
-    // a fireball still far away: Street jumps over it now and then
-    if (me.style === 'street' && eta > 14 && eta < 26 && dist > 12000 && Math.random() < skill * 0.15) {
-      this.plan([[UP | F, 3], ...wait(14), ...tap(B6), ...wait(10)]);
-      return this.think(m);
-    }
-    // a Drive Impact winding up: get out of the way or throw it
-    if (op.state === 'move' && moveOf(op).tag === 'driveImpact' && op.moveFrame < 18 && Math.random() < skill) {
-      if (dist < 6000) this.plan([...tap(B1 | B4), ...wait(30)]);
-      else if (me.style === 'iron') this.plan([[DOWN, 1], [0, 1], [DOWN, 1], ...wait(20)]);
-      else this.plan([[B, 1], [0, 1], [B, 1], ...wait(20)]);
-      return this.think(m);
-    }
-    if (this.cooldown-- > 0) return 0;
-    const ai = me.style === 'iron' ? IRON : STREET;
-    // meter and comeback tools
-    if (me.style === 'iron') {
-      if (isRage(me) && dist < 7000 && Math.random() < 0.25) {
-        this.plan([[DOWN | F | B1 | B2, 2], ...wait(50)]);
-        return this.think(m);
-      }
-      if (me.heatTimer > 0 && dist < 8000 && Math.random() < 0.18) {
-        this.plan([...tap(B3), ...wait(40)]);
-        return this.think(m);
-      }
-      if (me.heatAvailable && me.heatTimer <= 0 && dist < 9000 && Math.random() < 0.1) {
-        this.plan([...tap(B3), ...wait(34)]);
-        return this.think(m);
-      }
-    } else if (me.superMeter >= 10000 && dist < 7500 && Math.random() < 0.12) {
-      const btn = me.superMeter >= 30000 ? B3 : B6;
-      this.plan([[DOWN, 1], [DOWN | F, 1], [F, 1], [DOWN, 1], [DOWN | F, 1], [F | btn, 2], ...wait(50)]);
-      return this.think(m);
-    }
-    // punish a whiffed or blocked unsafe move
-    if (op.state === 'move' && op.moveFrame > moveOf(op).startup + moveOf(op).active && dist < 9000 && Math.random() < skill * 0.7) {
-      this.plan(ai.punish());
-      return this.think(m);
-    }
-    // anti-air a jump-in when it's about to land in front (falling, within reach)
-    if ((op.state === 'air' || (op.y > 4000 && op.state === 'move')) && op.vy < 300 && dist < 9500 && Math.random() < skill * 0.6) {
-      this.plan(ai.antiAir());
-      return this.think(m);
-    }
-    const pick = <T>(list: T[]) => list[Math.floor(Math.random() * list.length)];
-    if (Math.random() < 0.22) {
-      this.cooldown = 4 + Math.floor(Math.random() * 14);
-      return 0;
-    }
-    // Iron against a crouching opponent: mids (highs would whiff)
-    if (me.style === 'iron' && op.crouching && dist < 9000 && Math.random() < skill) {
-      const mids: Step[][] = [
-        [...tap(DOWN | F | B1), ...wait(12)],
-        [...tap(DOWN | F | B5), ...wait(18)],
-        [...tap(F | B2), ...wait(24)],
-        [...tap(DOWN | F | B2), ...wait(22), ...tap(B4), ...wait(5), ...tap(B2), ...wait(20)],
-      ];
-      this.plan(pick(mids));
-      this.cooldown = [18, 9, 4][this.level] ?? 9;
-      return this.think(m);
-    }
-    const zone = dist > 15000 ? ai.far : dist > 9000 ? ai.mid : ai.close;
-    this.plan(pick(zone)());
-    this.cooldown = [18, 9, 4][this.level] ?? 9;
-    return this.think(m);
+    this.guardFor = 0;
+    this.dodgeRoll = -1;
   }
 
   private plan(steps: Step[]) {
     this.queue = steps.map((s): Step => [s[0], s[1]]);
     this.hold = 0;
   }
+
+  think(m: MatchState): number {
+    const me = m.fighters[this.side];
+    const op = m.fighters[1 - this.side];
+    if (m.phase !== 'fight') {
+      this.reset();
+      return 0;
+    }
+    const skill = [0.35, 0.6, 0.85][this.level] ?? 0.6;
+    // beam clash: mash
+    if (m.clash) {
+      this.queue = [];
+      this.mashTick++;
+      const rate = [3, 2, 1][this.level] ?? 2;
+      return this.mashTick % (rate + 1) === 0 ? [L, H, S][this.mashTick % 3] : 0;
+    }
+    if (me.state === 'thrown') return me.stateFrame >= 3 && Math.random() < (skill * 0.6) / 4 ? L | G : 0;
+    const dist = len(op.x - me.x, op.z - me.z);
+    // a fireball about to arrive interrupts walking and waiting (not attacks already being input)
+    const eta = projectileEta(m, me);
+    const busy = this.queue.length && (this.queue[0][0] & (L | H | S | D)) !== 0;
+    if (eta >= 0 && eta <= 14 && !busy && actionable(me)) {
+      if (this.dodgeRoll < 0) this.dodgeRoll = Math.random();
+      if (this.dodgeRoll < skill) {
+        this.queue = [];
+        if (eta <= 10 && eta >= 2 && this.dodgeRoll < skill * 0.8) this.plan([...tap(Math.random() < 0.5 ? SIDE | D : SIDE2 | D), ...wait(14)]);
+        else this.guardFor = Math.max(this.guardFor, eta + 10);
+      }
+    } else if (eta < 0) this.dodgeRoll = -1;
+    // a beam coming this way: get out of its line, or answer it with your own
+    const beam = m.beams.find((b) => b.owner !== me.side && !b.clashing);
+    if (beam && actionable(me) && !busy) {
+      if (me.superMeter >= 20000 && Math.random() < skill * 0.5) {
+        this.plan([...tap(me.style === 'street' ? A | S | G : S | G), ...wait(40)]);
+      } else this.plan([...tap(Math.random() < 0.5 ? SIDE | D : SIDE2 | D), ...wait(16)]);
+    }
+    // finish the current plan
+    if (this.queue.length) {
+      const step = this.queue[0];
+      if (++this.hold >= step[1]) {
+        this.queue.shift();
+        this.hold = 0;
+      }
+      return resolve(m, me, step[0]);
+    }
+    if (this.guardFor > 0) {
+      this.guardFor--;
+      return G;
+    }
+    if (!actionable(me)) return 0;
+    // see an attack coming: guard it or step aside
+    if (isThreat(op, dist) && Math.random() < skill * 0.5) {
+      if (Math.random() < 0.25) {
+        this.plan([...tap(Math.random() < 0.5 ? SIDE | D : SIDE2 | D), ...wait(12)]);
+        return this.think(m);
+      }
+      this.guardFor = 14 + Math.floor(Math.random() * 10);
+      return G;
+    }
+    if (this.cooldown-- > 0) return 0;
+    const ai = plansFor(me);
+    const pick = <X>(list: X[]) => list[Math.floor(Math.random() * list.length)];
+    // punish a whiffed or blocked unsafe move
+    if (op.state === 'move' && op.moveFrame > moveOf(op).startup + moveOf(op).active && dist < 9000 && Math.random() < skill * 0.7) {
+      this.plan(ai.punish());
+      return this.think(m);
+    }
+    // anti-air a jump-in that is about to land in front
+    if ((op.state === 'air' || op.state === 'airdash') && op.vy < 300 && dist < 9500 && Math.random() < skill * 0.6) {
+      this.plan(ai.antiAir());
+      return this.think(m);
+    }
+    // meter and team tools
+    if (me.superMeter >= 10000 && dist < 9000 && Math.random() < 0.1) {
+      const dir = me.style === 'street' && me.superMeter >= 30000 ? T : 0;
+      this.plan([...tap(dir | S | G), ...wait(50)]);
+      return this.think(m);
+    }
+    if (STYLES[me.style].team) {
+      if (me.assistCD === 0 && !m.assists[me.side] && Math.random() < 0.07) {
+        this.plan([...tap(L | H), ...wait(4)]);
+        return this.think(m);
+      }
+      if (me.tagCD === 0 && op.state === 'knockdown' && Math.random() < 0.3) {
+        this.plan([...tap(H | S), ...wait(30)]);
+        return this.think(m);
+      }
+    }
+    if (Math.random() < 0.2) {
+      this.cooldown = 4 + Math.floor(Math.random() * 14);
+      return 0;
+    }
+    const zone = dist > 35000 ? ai.far : dist > 12000 ? ai.mid : ai.close;
+    this.plan(pick(zone)());
+    this.cooldown = [18, 9, 4][this.level] ?? 9;
+    return this.think(m);
+  }
 }
 
-// frames until the nearest enemy projectile reaches this fighter, or -1
+// frames until the nearest enemy projectile reaches this fighter (or will, if it's still being thrown), or -1
 function projectileEta(m: MatchState, me: FighterState): number {
   let best = -1;
   for (const p of m.projectiles) {
-    if (p.owner === me.side || p.dodged || Math.sign(p.vx) !== Math.sign(me.x - p.x)) continue;
-    const eta = Math.max(0, (Math.abs(p.x - me.x) - 3300) / Math.abs(p.vx));
+    if (p.owner === me.side || p.dodged) continue;
+    const [tx, tz] = norm(me.x - p.x, me.z - p.z);
+    if (tx * p.dx + tz * p.dz < 0) continue;
+    const eta = Math.max(0, (len(me.x - p.x, me.z - p.z) - 3800) / p.speed);
     if (best < 0 || eta < best) best = eta;
   }
-  // a fireball still in its startup: read the throwing motion
   const op = m.fighters[1 - me.side];
   if (op.state === 'move') {
     const mv = moveOf(op);
     if (mv.projectile && op.moveFrame < mv.startup) {
-      const travel = Math.max(0, Math.abs(op.x - me.x) - mv.projectile.spawnX - 3300) / mv.projectile.speed;
+      const travel = Math.max(0, len(op.x - me.x, op.z - me.z) - mv.projectile.spawnF - 3800) / mv.projectile.speed;
       const eta = mv.startup - op.moveFrame + travel;
       if (best < 0 || eta < best) best = eta;
     }
@@ -254,24 +305,16 @@ function projectileEta(m: MatchState, me: FighterState): number {
   return best;
 }
 
-function isThreat(op: FighterState, me: FighterState, dist: number, m: MatchState) {
-  if (op.state === 'move') {
-    const mv = moveOf(op);
-    if (mv.hitbox && op.moveFrame <= mv.startup + mv.active && dist < (mv.hitbox.x + mv.hitbox.w) + 3500) return true;
-  }
-  return m.projectiles.some((p) => p.owner !== me.side && Math.abs(p.x - me.x) < 9000);
-}
-
-function guardFor(me: FighterState, op: FighterState): number {
-  const low = op.state === 'move' && moveOf(op).height === 'low';
-  const overhead = op.state === 'move' && (moveOf(op).height === 'overhead' || op.y > 0);
-  if (me.style === 'iron') return low ? DOWN : overhead ? 0 : 0;
-  return low ? DOWN | B : overhead ? B : B;
+function isThreat(op: FighterState, dist: number) {
+  if (op.state === 'dash' && dist < 16000) return true;
+  if (op.state !== 'move') return false;
+  const mv = moveOf(op);
+  return !!mv.hitbox && op.moveFrame <= mv.startup + mv.active && dist < mv.hitbox.f1 + 6000;
 }
 
 // training dummy behaviours
 export class Dummy {
-  private blockTimer = 0;
+  private guardTimer = 0;
   private cpu: Cpu;
   constructor(private side: 0 | 1) {
     this.cpu = new Cpu(side, 1);
@@ -283,19 +326,20 @@ export class Dummy {
     switch (opts.dummy) {
       case 'stand':
         return 0;
-      case 'crouch':
-        return DOWN;
+      case 'guard':
+        return G;
       case 'jump':
-        return actionable(me) ? UP : 0;
+        return actionable(me) ? J : 0;
       case 'cpu':
         return this.cpu.think(m);
-      case 'block':
-        return resolve(guardFor(me, op), me.facing);
-      case 'blockAfterFirst': {
-        if (me.state === 'hitstun' || me.state === 'juggle') this.blockTimer = 50;
-        if (this.blockTimer > 0) {
-          this.blockTimer--;
-          return resolve(guardFor(me, op), me.facing);
+      case 'sidedash':
+        // dodge anything that comes at it
+        return actionable(me) && (isThreat(op, len(op.x - me.x, op.z - me.z)) || projectileEta(m, me) >= 0) && m.frame % 2 === 0 ? resolve(m, me, SIDE | D) : 0;
+      case 'guardAfterFirst': {
+        if (me.state === 'hitstun' || me.state === 'juggle') this.guardTimer = 50;
+        if (this.guardTimer > 0) {
+          this.guardTimer--;
+          return G;
         }
         return 0;
       }

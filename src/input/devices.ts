@@ -1,5 +1,6 @@
 // Keyboard and gamepad → raw input bits for each player. Two players can share one keyboard, and each
 // player also reads one gamepad (the first pad for P1, the second for P2; "swap pads" flips that).
+// The six buttons, in order: Light, Heavy, Special, Jump, Guard, Dash.
 
 import { IN } from '../sim/input';
 
@@ -61,8 +62,9 @@ export const KEY_LABELS: Record<string, string> = {
   Numpad6: 'Num6',
 };
 
-// standard gamepad mapping: X Y RB / A B RT (Xbox names) = buttons 1-6, like the 6-button fighting layout
-const PAD_BUTTONS = [2, 3, 5, 0, 1, 7];
+// standard gamepad mapping (Xbox names): X light, Y heavy, B special, A jump, RB guard, LB dash
+const PAD_BUTTONS = [2, 3, 1, 0, 5, 4];
+export const BUTTON_BITS = [IN.L, IN.H, IN.S, IN.J, IN.G, IN.D];
 const PAD_START = 9;
 
 export interface MenuIn {
@@ -109,9 +111,8 @@ export class Devices {
     if (any(km.down)) bits |= IN.DOWN;
     if (any(km.left)) bits |= IN.LEFT;
     if (any(km.right)) bits |= IN.RIGHT;
-    const btn = [IN.B1, IN.B2, IN.B3, IN.B4, IN.B5, IN.B6];
     km.buttons.forEach((codes, i) => {
-      if (any(codes)) bits |= btn[i];
+      if (any(codes)) bits |= BUTTON_BITS[i];
     });
     const pad = this.pads()[side];
     if (pad) bits |= padBits(pad);
@@ -150,8 +151,8 @@ export class Devices {
       if (edge & IN.DOWN) o.down = true;
       if (edge & IN.LEFT) o.left = true;
       if (edge & IN.RIGHT) o.right = true;
-      if (edge & IN.B4) o.ok = true; // A
-      if (edge & IN.B5) o.back = true; // B
+      if (edge & IN.J) o.ok = true; // A
+      if (edge & IN.S) o.back = true; // B
       if (edge & (1 << 12)) o.pause = true;
     });
     for (const o of out) o.any = o.up || o.down || o.left || o.right || o.ok || o.back || o.pause;
@@ -181,13 +182,12 @@ function padBits(pad: Gamepad): number {
   if (b(13) || ay > 0.5) bits |= IN.DOWN;
   if (b(14) || ax < -0.5) bits |= IN.LEFT;
   if (b(15) || ax > 0.5) bits |= IN.RIGHT;
-  const btn = [IN.B1, IN.B2, IN.B3, IN.B4, IN.B5, IN.B6];
   PAD_BUTTONS.forEach((i, k) => {
-    if (b(i)) bits |= btn[k];
+    if (b(i)) bits |= BUTTON_BITS[k];
   });
-  // LB = 2-button shortcut for MP+MK (Drive Parry) / 2+3 (Heat); LT = HP+HK (Drive Impact)
-  if (b(4)) bits |= IN.B2 | IN.B5;
-  if (b(6)) bits |= IN.B3 | IN.B6;
+  // two-button shortcuts: RT = light + heavy (Drive Parry / assist), LT = heavy + special (Drive Impact / tag)
+  if (b(7)) bits |= IN.L | IN.H;
+  if (b(6)) bits |= IN.H | IN.S;
   return bits;
 }
 

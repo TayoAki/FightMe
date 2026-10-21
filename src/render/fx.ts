@@ -153,7 +153,7 @@ export class Rings {
     r.mesh.position.set(x, y, z);
     (r.mesh.material as THREE.MeshBasicMaterial).color.copy(color);
     r.life = r.life0 = life;
-    r.grow = size;
+    r.grow = size * 0.65;
     r.mesh.visible = true;
   }
 
@@ -165,7 +165,7 @@ export class Rings {
       const s = 0.05 + r.grow * (1 - (1 - u) * (1 - u));
       r.mesh.scale.setScalar(s);
       r.mesh.quaternion.copy(camera.quaternion);
-      (r.mesh.material as THREE.MeshBasicMaterial).opacity = (1 - u) * (1 - u) * 0.6;
+      (r.mesh.material as THREE.MeshBasicMaterial).opacity = (1 - u) * (1 - u) * 0.5;
       if (r.life <= 0) r.mesh.visible = false;
     }
   }
@@ -176,7 +176,7 @@ export class Orbs {
   private meshes: THREE.Group[] = [];
 
   constructor() {
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 10; i++) {
       const g = new THREE.Group();
       const core = new THREE.Mesh(new THREE.SphereGeometry(0.1, 20, 14), new THREE.MeshBasicMaterial({ color: '#ffffff' }));
       const shell = new THREE.Mesh(
@@ -190,16 +190,78 @@ export class Orbs {
     }
   }
 
-  sync(list: Array<{ x: number; y: number; color: THREE.Color; t: number }>) {
+  // size: 1 for a normal orb; bolts are smaller and stretched along their flight
+  sync(list: Array<{ x: number; y: number; z: number; dx: number; dz: number; color: THREE.Color; t: number; size: number; stretch: number }>) {
     this.meshes.forEach((g, i) => {
       const p = list[i];
       g.visible = !!p;
       if (!p) return;
-      g.position.set(p.x, p.y, 0.05);
+      g.position.set(p.x, p.y, p.z);
+      g.rotation.set(0, Math.atan2(p.dx, p.dz), 0);
+      g.scale.set(p.size, p.size, p.size * p.stretch);
       const shell = g.children[1] as THREE.Mesh;
       (shell.material as THREE.MeshBasicMaterial).color.copy(p.color);
-      const pulse = 1 + Math.sin(p.t * 0.6) * 0.12;
-      shell.scale.setScalar(pulse);
+      shell.scale.setScalar(1 + Math.sin(p.t * 0.6) * 0.12);
     });
+  }
+}
+
+// beams: a white core inside a coloured glow, and a churning ball where two beams clash
+export class Beams {
+  readonly group = new THREE.Group();
+  private beams: Array<{ root: THREE.Group; core: THREE.Mesh; glow: THREE.Mesh; tip: THREE.Mesh }> = [];
+  private clashBall: THREE.Group;
+  private up = new THREE.Vector3(0, 1, 0);
+  private dir = new THREE.Vector3();
+
+  constructor() {
+    const cyl = new THREE.CylinderGeometry(1, 1, 1, 18, 1, true);
+    const ball = new THREE.SphereGeometry(1, 24, 16);
+    for (let i = 0; i < 4; i++) {
+      const root = new THREE.Group();
+      const core = new THREE.Mesh(cyl, new THREE.MeshBasicMaterial({ color: '#ffffff' }));
+      const glow = new THREE.Mesh(cyl, new THREE.MeshBasicMaterial({ color: '#5ff2ff', transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+      const tip = new THREE.Mesh(ball, new THREE.MeshBasicMaterial({ color: '#5ff2ff', transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false }));
+      root.add(core, glow, tip);
+      root.visible = false;
+      this.group.add(root);
+      this.beams.push({ root, core, glow, tip });
+    }
+    this.clashBall = new THREE.Group();
+    this.clashBall.add(
+      new THREE.Mesh(ball, new THREE.MeshBasicMaterial({ color: '#ffffff' })),
+      new THREE.Mesh(ball, new THREE.MeshBasicMaterial({ color: '#ffd34d', transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false })),
+    );
+    this.clashBall.visible = false;
+    this.group.add(this.clashBall);
+  }
+
+  // each beam runs from (x, y, z) along (dx, dz) for `len` metres
+  sync(list: Array<{ x: number; y: number; z: number; dx: number; dz: number; len: number; width: number; color: THREE.Color }>, clash: { x: number; y: number; z: number; t: number } | null, t: number) {
+    this.beams.forEach((b, i) => {
+      const p = list[i];
+      b.root.visible = !!p && p.len > 0.05;
+      if (!p || !b.root.visible) return;
+      this.dir.set(p.dx, 0, p.dz).normalize();
+      b.root.position.set(p.x, p.y, p.z);
+      b.root.quaternion.setFromUnitVectors(this.up, this.dir);
+      const flicker = 1 + Math.sin(t * 1.7 + i) * 0.08;
+      const w = p.width * flicker;
+      b.core.scale.set(w * 0.3, p.len, w * 0.3);
+      b.core.position.y = p.len / 2;
+      b.glow.scale.set(w * 0.8, p.len, w * 0.8);
+      b.glow.position.y = p.len / 2;
+      (b.glow.material as THREE.MeshBasicMaterial).color.copy(p.color);
+      (b.tip.material as THREE.MeshBasicMaterial).color.copy(p.color);
+      b.tip.scale.setScalar(w * 1.5);
+      b.tip.position.y = p.len;
+    });
+    this.clashBall.visible = !!clash;
+    if (clash) {
+      this.clashBall.position.set(clash.x, clash.y, clash.z);
+      const s = 0.45 + Math.sin(t * 0.9) * 0.08;
+      this.clashBall.children[0].scale.setScalar(s * 0.55);
+      this.clashBall.children[1].scale.setScalar(s);
+    }
   }
 }

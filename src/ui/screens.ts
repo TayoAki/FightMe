@@ -5,7 +5,9 @@ import { KEYMAPS, KEY_LABELS } from '../input/devices';
 import { PALETTES } from '../render/rig';
 import { STYLES, STYLE_IDS } from '../sim/styles';
 import type { StyleId } from '../sim/types';
-import { MOVELIST } from './movelist';
+import { MOVELIST, UNIVERSAL, type MoveSection } from './movelist';
+
+const BUTTON_NAMES = ['LIGHT', 'HEAVY', 'SPECIAL', 'JUMP', 'GUARD', 'DASH'];
 
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', parent?: HTMLElement, html = '') => {
   const e = document.createElement(tag);
@@ -89,7 +91,7 @@ export class SelectScreen {
   private hint: HTMLElement;
   picks: [Pick, Pick] = [
     { style: 'street', palette: 0, ready: false },
-    { style: 'iron', palette: 1, ready: false },
+    { style: 'tag', palette: 1, ready: false },
   ];
   // in VS CPU and Training, P1 also picks the opponent once they are ready
   p2ByP1 = false;
@@ -170,7 +172,8 @@ export class SelectScreen {
         <div class="card-style"><span class="arrow" data-act="prev">◀</span><b>${st.name.toUpperCase()}</b><span class="arrow" data-act="next">▶</span></div>
         <div class="card-inspired">mechanics inspired by ${st.inspired}</div>
         <div class="card-tag">${st.tagline}</div>
-        <div class="card-buttons">${st.buttonLabels.map((b, k) => `<span class="key">${keyName(i as 0 | 1, k)}</span><span class="btn">${b}</span>`).join('')}</div>
+        <div class="card-team">${st.team ? st.kits.map((k) => `<span class="btn">${k.name.toUpperCase()}</span>`).join(' + ') : '&nbsp;'}</div>
+        <div class="card-buttons">${BUTTON_NAMES.map((b, k) => `<span class="key">${keyName(i as 0 | 1, k)}</span><span class="btn">${b}</span>`).join('')}</div>
         <div class="swatches">${swatches}</div>
         <button class="card-ready" data-act="ready">${p.ready ? 'READY ✓' : 'CONFIRM'}</button>`;
     });
@@ -192,29 +195,33 @@ function keyName(side: 0 | 1, i: number) {
 
 // ------------------------------------------------------------------------------------------- how to play
 
+function section(parent: HTMLElement, sec: MoveSection, sub = '') {
+  const col = el('div', 'howto-col', parent);
+  el('h2', '', col, `${sec.title.toUpperCase()}${sub ? ` <small>${sub}</small>` : ''}`);
+  const ul = el('ul', 'howto-system', col);
+  for (const s of sec.system) el('li', '', ul, s);
+  if (!sec.moves.length) return;
+  const table = el('table', 'howto-moves', col);
+  for (const m of sec.moves) {
+    const tr = el('tr', '', table);
+    el('td', 'mv-name', tr, m.name);
+    el('td', 'mv-input', tr, m.input);
+    el('td', 'mv-note', tr, m.note ?? '');
+  }
+}
+
 export function buildHowTo(parent: HTMLElement, onBack: () => void) {
   const root = el('div', 'screen howto', parent);
   el('h1', 'screen-title', root, 'HOW TO PLAY');
   const intro = el('div', 'howto-intro', root);
   intro.innerHTML =
-    'Every fighter picks a <b>style</b>: the mechanics and controls they play with. A Street player and an Iron player can fight each other, each with the controls they know. ' +
+    'Every fighter picks a <b>style</b>: the mechanics they play with. All styles share the same six buttons: <b>Light, Heavy, Special, Jump, Guard, Dash</b>. ' +
     'Keyboard: P1 moves with <b>WASD</b>, buttons <b>U I O / J K L</b>. P2 moves with the <b>arrows</b>, buttons <b>Num 7 8 9 / 4 5 6</b> (or <b>Ins Home PgUp / Del End PgDn</b>). ' +
-    'Pads: Xbox <b>X Y RB / A B RT</b>, <b>LB</b> = MP+MK, <b>LT</b> = HP+HK. Pause: <b>Esc</b> / Start.';
+    'Pads (Xbox names): <b>X</b> Light, <b>Y</b> Heavy, <b>B</b> Special, <b>A</b> Jump, <b>RB</b> Guard, <b>LB</b> Dash, <b>RT</b> = Light + Heavy, <b>LT</b> = Heavy + Special. Pause: <b>Esc</b> / Start.';
   const cols = el('div', 'howto-cols', root);
+  section(cols, UNIVERSAL);
   for (const id of STYLE_IDS) {
-    const st = STYLES[id];
-    const col = el('div', 'howto-col', cols);
-    el('h2', '', col, `${st.name.toUpperCase()} <small>inspired by ${st.inspired}</small>`);
-    el('div', 'howto-buttons', col, `Buttons 1-6: ${st.buttonLabels.map((b) => `<span class="btn">${b}</span>`).join(' ')}`);
-    const ul = el('ul', 'howto-system', col);
-    for (const s of MOVELIST[id].system) el('li', '', ul, s);
-    const table = el('table', 'howto-moves', col);
-    for (const m of MOVELIST[id].moves) {
-      const tr = el('tr', '', table);
-      el('td', 'mv-name', tr, m.name);
-      el('td', 'mv-input', tr, m.input);
-      el('td', 'mv-note', tr, m.note ?? '');
-    }
+    MOVELIST[id].forEach((sec, i) => section(cols, sec, i === 0 ? `inspired by ${STYLES[id].inspired}` : ''));
   }
   const back = el('button', 'menu-item focus back', root, 'BACK');
   back.addEventListener('click', onBack);
